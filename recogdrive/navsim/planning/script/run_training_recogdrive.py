@@ -28,26 +28,54 @@ CONFIG_NAME = "default_training"
 def custom_collate_fn(
     batch: List[Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]]
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-    features_list, targets_list, tokens_list = zip(*batch)
+    if len(batch[0]) == 3:
+        features_list, targets_list, tokens_list = zip(*batch)
+    elif len(batch[0]) == 2:
+        features_list, targets_list = zip(*batch)
+        tokens_list = tuple([None] * len(batch))
+    else:
+        raise ValueError(f"Unexpected batch item length: {len(batch[0])}. Expected 2 or 3.")
 
     history_trajectory = torch.stack([features['history_trajectory'] for features in features_list], dim=0).cpu()
     high_command_one_hot = torch.stack([features['high_command_one_hot'] for features in features_list], dim=0).cpu()
     status_feature = torch.stack([features['status_feature'] for features in features_list], dim=0).cpu()
-
-    last_hidden_state = rnn_utils.pad_sequence(
-        [features['last_hidden_state'] for features in features_list],
-        batch_first=True,
-        padding_value=0.0
-    ).clone().detach()
 
     trajectory = torch.stack([targets['trajectory'] for targets in targets_list], dim=0).cpu()
 
     features = {
         'history_trajectory': history_trajectory,
         'high_command_one_hot': high_command_one_hot,
-        'last_hidden_state': last_hidden_state,
         'status_feature': status_feature
     }
+
+    # Backward-compatible dual path:
+    # 1) Cached hidden-state training: batch contains `last_hidden_state`.
+    # 2) Online backbone fine-tuning: batch contains `image_path_tensor`.
+    if all('last_hidden_state' in f for f in features_list):
+        last_hidden_state = rnn_utils.pad_sequence(
+            [features['last_hidden_state'] for features in features_list],
+            batch_first=True,
+            padding_value=0.0
+        ).clone().detach()
+        features['last_hidden_state'] = last_hidden_state
+
+    if all('pixel_values' in f for f in features_list):
+        # Keep as list-like packed tensor [B, P, C, H, W] with per-sample patch count P potentially varying.
+        # Here we pad on patch dimension for batching.
+        pixel_values = rnn_utils.pad_sequence(
+            [features['pixel_values'] for features in features_list],
+            batch_first=True,
+            padding_value=0.0
+        ).clone().detach()
+        features['pixel_values'] = pixel_values
+
+    if all('image_path_tensor' in f for f in features_list):
+        image_path_tensor = rnn_utils.pad_sequence(
+            [features['image_path_tensor'] for features in features_list],
+            batch_first=True,
+            padding_value=0
+        ).clone().detach()
+        features['image_path_tensor'] = image_path_tensor
 
     targets = {
         'trajectory': trajectory

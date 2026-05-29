@@ -29,7 +29,11 @@ class AgentLightningModule(pl.LightningModule):
         #prediction = self.agent.forward(features,targets)
         loss = self.agent.compute_loss(features, targets, prediction)
         self.log(f"{logging_prefix}/loss", loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
-        
+        extra_logs = getattr(self.agent, "latest_loss_logs", {})
+        for k, v in extra_logs.items():
+            if v is not None:
+                self.log(f"{logging_prefix}/{k}", v, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+
         return loss
     
     def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:

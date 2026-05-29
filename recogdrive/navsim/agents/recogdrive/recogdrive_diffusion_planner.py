@@ -49,6 +49,7 @@ from .blocks.encoder import (
     SwiGLUFFN,
 )
 from .recogdrive_dit import LightningDiT
+from .recog_world_denoise_modulation import WorldDenoiseModulator
 
 @dataclass
 class FlowConfig:
@@ -114,6 +115,25 @@ class ReCogDriveDiffusionPlannerConfig(PretrainedConfig):
     tune_projector: bool = True
     tune_diffusion_model: bool = True
     
+    use_world_denoise_influence: bool = False
+    world_denoise_influence_type: str = "cross_attn"
+    use_world_denoise_cross_attn: bool = False
+    use_world_denoise_film: bool = False
+    world_denoise_dim: int = 256
+    world_denoise_num_heads: int = 4
+    world_denoise_dropout: float = 0.0
+    world_denoise_use_scene: bool = True
+    world_denoise_use_agent: bool = True
+    world_denoise_use_goal: bool = True
+    world_denoise_pooling: str = "none"
+    world_denoise_apply_layers: list = field(default_factory=list)
+    world_denoise_apply_steps: str = "all"
+    world_denoise_custom_steps: list = field(default_factory=list)
+    world_denoise_residual_scale: float = 1.0
+    world_denoise_gate_init: float = -2.0
+    world_denoise_detach_world_tokens: bool = False
+    debug_world_denoise_influence: bool = False
+
     flow_cfg: FlowConfig = field(default_factory=FlowConfig)
     ddpm_cfg: DDPMConfig = field(default_factory=DDPMConfig)
     ddim_cfg: DDIMConfig = field(default_factory=DDIMConfig)
@@ -182,6 +202,21 @@ class ReCogDriveDiffusionPlanner(nn.Module):
             self._init_ddpm_sampler(config.ddpm_cfg)
         elif self.config.sampling_method == 'ddim':
             self._init_ddim_sampler(config.ddim_cfg)
+
+        self.world_denoise_modulator = None
+        if config.use_world_denoise_influence:
+            self.world_denoise_modulator = WorldDenoiseModulator(
+                denoise_dim=config.input_embedding_dim,
+                world_dim=config.world_denoise_dim,
+                influence_type=config.world_denoise_influence_type,
+                num_heads=config.world_denoise_num_heads,
+                dropout=config.world_denoise_dropout,
+                pooling=config.world_denoise_pooling,
+                residual_scale=config.world_denoise_residual_scale,
+                gate_init=config.world_denoise_gate_init,
+                use_cross_attn=config.use_world_denoise_cross_attn,
+                use_film=config.use_world_denoise_film,
+            )
 
         if config.grpo:
             self._init_grpo(config.grpo_cfg)
@@ -443,7 +478,7 @@ class ReCogDriveDiffusionPlanner(nn.Module):
 
         return model_mean, model_log_variance, x_recon
 
-    def forward(self, vl_features: torch.Tensor, action_input: BatchFeature) -> BatchFeature:
+    def forward(self, vl_features: torch.Tensor, action_input: BatchFeature, world_tokens: Optional[Dict[str, torch.Tensor]] = None) -> BatchFeature:
         """
         Computes the training loss for a given batch.
 
@@ -482,6 +517,16 @@ class ReCogDriveDiffusionPlanner(nn.Module):
                 torch.cat((his_traj_features, vl_embeds_mean, action_features), dim=2)
             )
 
+            if self.world_denoise_modulator is not None and world_tokens is not None:
+                wt = {k: (v.detach() if self.config.world_denoise_detach_world_tokens else v) for k, v in world_tokens.items()}
+                fused_input, _ = self.world_denoise_modulator(
+                    fused_input,
+                    wt,
+                    use_scene=self.config.world_denoise_use_scene,
+                    use_agent=self.config.world_denoise_use_agent,
+                    use_goal=self.config.world_denoise_use_goal,
+                    debug=self.config.debug_world_denoise_influence,
+                )
             model_output = self.model(fused_input, vl_embeds, ego_status_features, t_discrete)
             pred_velocity = self.action_decoder(model_output)
             loss = F.mse_loss(pred_velocity, velocity_target, reduction='mean')
@@ -504,6 +549,16 @@ class ReCogDriveDiffusionPlanner(nn.Module):
                 torch.cat((his_traj_features, vl_embeds_mean, action_features), dim=2)
             )
             
+            if self.world_denoise_modulator is not None and world_tokens is not None:
+                wt = {k: (v.detach() if self.config.world_denoise_detach_world_tokens else v) for k, v in world_tokens.items()}
+                fused_input, _ = self.world_denoise_modulator(
+                    fused_input,
+                    wt,
+                    use_scene=self.config.world_denoise_use_scene,
+                    use_agent=self.config.world_denoise_use_agent,
+                    use_goal=self.config.world_denoise_use_goal,
+                    debug=self.config.debug_world_denoise_influence,
+                )
             model_output = self.model(fused_input, vl_embeds, ego_status_features, t_discrete)
             pred_noise = self.action_decoder(model_output)
             loss = F.mse_loss(pred_noise, noise, reduction='mean')
@@ -515,7 +570,8 @@ class ReCogDriveDiffusionPlanner(nn.Module):
         vl_features: torch.Tensor,
         action_input: BatchFeature,
         init_actions: Optional[torch.Tensor] = None,
-        deterministic: bool = False
+        deterministic: bool = False,
+        world_tokens: Optional[Dict[str, torch.Tensor]] = None
     ) -> BatchFeature:
         """
         Generates action trajectories via the configured sampling method.
@@ -566,6 +622,9 @@ class ReCogDriveDiffusionPlanner(nn.Module):
                     torch.cat((history_embeds, vl_embeds_mean, action_features), dim=2)
                 )
                 
+                if self.world_denoise_modulator is not None and world_tokens is not None:
+                    wt = {k: (v.detach() if self.config.world_denoise_detach_world_tokens else v) for k, v in world_tokens.items()}
+                    fused_input, _ = self.world_denoise_modulator(fused_input, wt, use_scene=self.config.world_denoise_use_scene, use_agent=self.config.world_denoise_use_agent, use_goal=self.config.world_denoise_use_goal, step_idx=i if "i" in locals() else None, debug=self.config.debug_world_denoise_influence)
                 model_output = self.model(fused_input, vl_embeds, ego_embeds, t)
                 pred = self.action_decoder(model_output)
                 
@@ -696,6 +755,9 @@ class ReCogDriveDiffusionPlanner(nn.Module):
                     torch.cat((his_traj_features, vl_features_mean, action_features), dim=2)
                 )
                 
+                if self.world_denoise_modulator is not None and world_tokens is not None:
+                    wt = {k: (v.detach() if self.config.world_denoise_detach_world_tokens else v) for k, v in world_tokens.items()}
+                    fused_input, _ = self.world_denoise_modulator(fused_input, wt, use_scene=self.config.world_denoise_use_scene, use_agent=self.config.world_denoise_use_agent, use_goal=self.config.world_denoise_use_goal, step_idx=i if "i" in locals() else None, debug=self.config.debug_world_denoise_influence)
                 model_output = self.model(fused_input, vl_features, ego_status_features, t_batch)
                 pred = self.action_decoder(model_output)
                 

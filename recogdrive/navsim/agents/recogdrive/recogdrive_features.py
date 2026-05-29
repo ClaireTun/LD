@@ -1,4 +1,5 @@
 from typing import Dict, Optional
+import os
 import torch
 import numpy as np
 import gzip
@@ -71,17 +72,36 @@ class ReCogDriveFeatureBuilder(AbstractFeatureBuilder):
 
 
         if not self.cache_hidden_state:
-            image_path = str(cameras[-1].cam_f0.image)
-            
-            path_as_ordinals = [ord(char) for char in image_path]
-            
-            path_tensor = torch.tensor(path_as_ordinals, dtype=torch.long)
-            
+            raw_image = cameras[-1].cam_f0.image
+
+            # Prefer filesystem path when available; fallback to in-memory image payload.
+            if isinstance(raw_image, (str, os.PathLike)) and os.path.exists(raw_image):
+                image_path = str(raw_image)
+                path_as_ordinals = [ord(char) for char in image_path]
+                path_tensor = torch.tensor(path_as_ordinals, dtype=torch.long)
+                return {
+                    "history_trajectory": history_trajectory.cpu(),
+                    "high_command_one_hot": high_command_one_hot.cpu(),
+                    "status_feature": status_feature.cpu(),
+                    "image_path_tensor": path_tensor.cpu(),
+                }
+
+            # Fallback: `cam_f0.image` is already an image array/PIL object, preprocess directly.
+            if isinstance(raw_image, Image.Image):
+                pil_image = raw_image.convert("RGB")
+            else:
+                image_array = np.asarray(raw_image)
+                if image_array.dtype != np.uint8:
+                    image_array = np.clip(image_array, 0, 255).astype(np.uint8)
+                pil_image = Image.fromarray(image_array).convert("RGB")
+
+            pixel_values = load_image(pil_image, max_num=12).squeeze(0)
+
             return {
                 "history_trajectory": history_trajectory.cpu(),
                 "high_command_one_hot": high_command_one_hot.cpu(),
                 "status_feature": status_feature.cpu(),
-                "image_path_tensor": path_tensor.cpu(),
+                "pixel_values": pixel_values.float().cpu(),
             }
         else:
             if self.backbone is None:

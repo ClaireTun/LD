@@ -1,3 +1,4 @@
+# B2: 预训练 DiT + world distill + modulation（完整方法）
 _target_: navsim.agents.recogdrive.recogdrive_agent.ReCogDriveAgent
 _convert_: 'all'
 
@@ -6,7 +7,9 @@ trajectory_sampling:
   _convert_: 'all'
   time_horizon: 4
   interval_length: 0.5
-checkpoint_path: ''
+
+checkpoint_path: '/path/to/pretrained_dit.ckpt'
+
 vlm_path: ''
 cam_type: 'single'
 vlm_type: 'internvl'
@@ -19,23 +22,28 @@ reference_policy_checkpoint: ''
 vlm_size: 'small'
 train_backbone: false
 grpo: False
-lr: 1e-4
-use_sgdrive_teacher: False
-sgdrive_teacher_config: ""
-sgdrive_teacher_checkpoint: ""
+lr: 1e-5
+
+# teacher on
+use_sgdrive_teacher: True
+sgdrive_teacher_config: '/workspace/LD/SGDrive/navsim/planning/script/config/common/agent/sgdrive_agent.yaml'
+sgdrive_teacher_checkpoint: '/path/to/sgdrive_stage1_world_model.ckpt'
 sgdrive_teacher_feature_keys: ["scene", "agent", "goal"]
 freeze_sgdrive_teacher: True
 teacher_eval_mode: True
 debug_print_teacher_shapes: False
+teacher_feature_source: "cached"  # 可改 online
 
-use_student_world_adapter: False
+# student world + distill on
+use_student_world_adapter: True
 student_world_dim: 256
 student_world_num_tokens: 1
 student_world_use_mlp: True
 student_world_use_cross_attn: False
 student_world_source: "cognition_tokens"
 student_world_dropout: 0.0
-use_structural_world_distill: False
+
+use_structural_world_distill: True
 struct_distill_loss_type: "cosine"
 struct_distill_weight: 1.0
 scene_distill_weight: 1.0
@@ -44,24 +52,24 @@ goal_distill_weight: 1.0
 detach_teacher: True
 normalize_distill_features: True
 
-use_world_tokens_as_planner_condition: False
+# planner condition on (simple stable)
+use_world_tokens_as_planner_condition: True
 world_condition_fusion_type: "concat"
 world_condition_detach: False
 world_condition_weight: 1.0
 
-teacher_feature_source: "cached"
-
-use_world_denoise_influence: False
-world_denoise_influence_type: "cross_attn"
-use_world_denoise_cross_attn: False
-use_world_denoise_film: False
+# denoise modulation on (完整方法核心)
+use_world_denoise_influence: True
+world_denoise_influence_type: "cross_attn_plus_film"
+use_world_denoise_cross_attn: True
+use_world_denoise_film: True
 world_denoise_dim: 256
 world_denoise_num_heads: 4
 world_denoise_dropout: 0.0
 world_denoise_use_scene: True
 world_denoise_use_agent: True
 world_denoise_use_goal: True
-world_denoise_pooling: "none"
+world_denoise_pooling: "mean"
 world_denoise_apply_layers: []
 world_denoise_apply_steps: "all"
 world_denoise_custom_steps: []
