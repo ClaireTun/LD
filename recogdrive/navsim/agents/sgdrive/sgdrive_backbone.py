@@ -1,17 +1,14 @@
 import os
+import sys
+from pathlib import Path
 from typing import List, Optional, Tuple, Union
 import torch
 from torch import nn
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoConfig, AutoModel, AutoTokenizer
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from internvl_chat.internvl.model.internvl_chat import (InternVisionConfig,
-                                          InternVisionModel,
-                                          InternVLChatConfig_WM,
-                                          InternVLChatModel_WM)
-
-
 from .utils.conversation import get_conv_template
-from ..intervl_agent_wm import format_number
+def format_number(n, decimal_places=2):
+    return f"{n:+.{decimal_places}f}" if abs(round(n, decimal_places)) > 1e-2 else "0.0"
 
 IMG_CONTEXT_TOKEN = "<IMG_CONTEXT>"
 IMG_START_TOKEN = "<img>"
@@ -38,6 +35,33 @@ Your predictions will be evaluated through a non-reactive 4-second simulation wi
 """
 
 
+def _normalize_sgdrive_template(config):
+    """Map SGDrive-only template aliases to templates available during loading."""
+    if getattr(config, "template", None) == "internvl2_5_world_token":
+        config.template = "internvl2_5"
+    return config
+
+
+def _ensure_internvl_wm_import_paths(checkpoint_path: str) -> None:
+    """Expose SGDrive's bundled InternVL-WM package as top-level ``internvl``."""
+    candidates = []
+    if checkpoint_path:
+        checkpoint = Path(checkpoint_path).resolve()
+        candidates.extend(parent / "internvl_chat" for parent in [checkpoint, *checkpoint.parents])
+    repo_root = Path(__file__).resolve().parents[4]
+    candidates.extend(
+        [
+            repo_root / "SGDrive" / "internvl_chat",
+            repo_root / "recogdrive" / "internvl_chat",
+        ]
+    )
+    for candidate in reversed(candidates):
+        if (candidate / "internvl").is_dir():
+            candidate_str = str(candidate)
+            if candidate_str not in sys.path:
+                sys.path.insert(0, candidate_str)
+
+
 class SGDriveBackbone(nn.Module):
     """
     A simplified vision-language model backbone with direct loading logic
@@ -58,6 +82,9 @@ class SGDriveBackbone(nn.Module):
         self.model = None
         self.tokenizer = None
         self.model_type = model_type.lower()
+        if self.model_type == "intervl_wm":
+            # Backward-compatible typo alias used in some experiment overrides.
+            self.model_type = "internvl_wm"
         self.device = device
 
         print(
@@ -66,8 +93,11 @@ class SGDriveBackbone(nn.Module):
 
         if self.model_type == "internvl":
             # --- Load InternVL Model and Tokenizer ---
+            config = AutoConfig.from_pretrained(checkpoint_path, trust_remote_code=True)
+            config = _normalize_sgdrive_template(config)
             self.model = AutoModel.from_pretrained(
                 checkpoint_path,
+                config=config,
                 torch_dtype=torch.bfloat16,
                 low_cpu_mem_usage=True,
                 trust_remote_code=True,
@@ -91,10 +121,19 @@ class SGDriveBackbone(nn.Module):
                 checkpoint_path, trust_remote_code=True
             )
         elif self.model_type == "internvl_wm":
+            _ensure_internvl_wm_import_paths(checkpoint_path)
+            from internvl.model.internvl_chat import InternVLChatConfig_WM, InternVLChatModel_WM
+
             config = InternVLChatConfig_WM.from_pretrained(checkpoint_path)
+            config = _normalize_sgdrive_template(config)
             config.output_hidden_states = True
-            config.llm_config._attn_implementation = "sdpa"
-            config.llm_config._attn_implementation_internal = "sdpa"
+            # FlashAttention/SDPA can fail on some SGDrive environments with
+            # dtype-mismatched attention bias tensors; eager is slower but robust.
+            config.llm_config.attn_implementation = "eager"
+            config.llm_config._attn_implementation = "eager"
+            config.llm_config._attn_implementation_internal = "eager"
+            if hasattr(config, "vision_config"):
+                config.vision_config.use_flash_attn = False
 
             self.num_image_token = 256
             if os.getenv("use_world_token", True):
@@ -107,12 +146,13 @@ class SGDriveBackbone(nn.Module):
                 self.world_token_number = self.occ_token_number + self.agent_token_number + self.gp_token_number
             if os.getenv("dream_world", True):
                 self.dream_token_number = self.occ_token_number + self.agent_token_number
-            
+
             self.model = InternVLChatModel_WM.from_pretrained(
                 checkpoint_path,
                 config=config,
-                torch_dtype=torch.bfloat16,   
-                device_map=self.device
+                torch_dtype=torch.bfloat16,
+                device_map=self.device,
+                use_flash_attn=False,
             )
 
             self.tokenizer = AutoTokenizer.from_pretrained(
@@ -131,7 +171,7 @@ class SGDriveBackbone(nn.Module):
                 self.dream_token_id = dream_token_id
         else:
             raise ValueError(
-                f"Unsupported model_type: '{self.model_type}'. Please choose 'internvl' or 'qwen'."
+                f"Unsupported model_type: '{self.model_type}'. Please choose 'internvl', 'internvl_wm', or 'qwen'."
             )
 
         print(
@@ -230,7 +270,7 @@ class SGDriveBackbone(nn.Module):
                     + WORLD_END_TOKEN
                 )
                 query = query.replace("<world>", world_tokens, 1)
-            
+
             if self.dream_token_number > 0:
                 dream_tokens = (
                     DREAM_START_TOKEN
@@ -274,7 +314,7 @@ class SGDriveBackbone(nn.Module):
                 selected = (input_ids == self.world_token_id)
                 last_hidden_state = outputs.hidden_states[-1].view(-1, C)
                 world_hidden = last_hidden_state[selected].view(B,-1,C).contiguous()
-                
+
                 if self.occ_token_number > 0:
                     occ_world_hidden = world_hidden[:,: self.occ_token_number, :]
                     # cls_pred = self._occ_head(occ_world_hidden, [[100, 100], [50, 50]])
@@ -295,7 +335,7 @@ class SGDriveBackbone(nn.Module):
                 selected = input_ids == self.dream_token_id
                 last_hidden_state = outputs.hidden_states[-1].view(-1, C)
                 dream_hidden = last_hidden_state[selected].view(B, -1, C).contiguous()
-                
+
                 if self.occ_token_number > 0:
                     occ_dream_hidden = dream_hidden[:, : self.occ_token_number, :]
                     final_outputs['dream_occ_out'] = occ_dream_hidden
@@ -304,7 +344,7 @@ class SGDriveBackbone(nn.Module):
                     # occ_loss_dream = self._occ_head.loss(cls_pred, lidar_gt_dream)
                     # cls_pred.detach().to(torch.float32).cpu().numpy().tofile("/lpai/output/data/cls_pred_dream.npy")
                     # lidar_gt_dream.cpu().numpy().tofile("/lpai/output/data/gt_dream.npy")
-                
+
                 if self.agent_token_number > 0:
                     agent_dream_hidden = dream_hidden[:, self.occ_token_number: self.occ_token_number+self.agent_token_number, :]
                     final_outputs['dream_agent_out'] = agent_dream_hidden
@@ -312,11 +352,11 @@ class SGDriveBackbone(nn.Module):
                     # tgt = {"agent_states": agent_states_ft, "agent_labels": agent_labels_ft}
                     # det_loss = self._agent_loss_v1(tgt, agent_out)
                     # agent_loss_dream = det_loss[0] + det_loss[1]
-                    
+
             final_outputs['outputs'] = outputs
-            
+
             return final_outputs
-    
+
     def preprocess_ego_status_hist_traj(self, ego_statuses):
         driving_command = torch.tensor(ego_statuses[-1].driving_command)
         ego_acceleration = torch.tensor(ego_statuses[-1].ego_acceleration, dtype=torch.float32)

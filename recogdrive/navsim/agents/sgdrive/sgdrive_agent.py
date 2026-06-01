@@ -237,7 +237,7 @@ class SGDriveAgent(AbstractAgent):
                 }
             )
             # return self.action_head(last_hidden_state, action_inputs)
-        
+
             return self.action_head([occ_hiddent_state, agent_hiddent_state, gp_hiddent_state, dream_occ_hiddent_state, dream_agent_hiddent_state], action_inputs)
         elif self.training and self.grpo:
             action_inputs = BatchFeature(

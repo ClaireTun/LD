@@ -8,15 +8,15 @@ trajectory_sampling:
   time_horizon: 4
   interval_length: 0.5
 
-checkpoint_path: '/path/to/pretrained_dit.ckpt'
+checkpoint_path: '/home/data/tuntun/project/LSD/premodel/ReCogDrive_Diffusion_Planner_2B_IL.ckpt'
 
-vlm_path: ''
+vlm_path: '/home/data/tuntun/project/SGDrive-main/ReCogDrive-VLM-2B'
 cam_type: 'single'
 vlm_type: 'internvl'
 dit_type: 'small'
 sampling_method: 'ddim'
 cache_mode: False
-cache_hidden_state: True
+cache_hidden_state: False
 metric_cache_path: ''
 reference_policy_checkpoint: ''
 vlm_size: 'small'
@@ -26,13 +26,16 @@ lr: 1e-5
 
 # teacher on
 use_sgdrive_teacher: True
-sgdrive_teacher_config: '/workspace/LD/SGDrive/navsim/planning/script/config/common/agent/sgdrive_agent.yaml'
-sgdrive_teacher_checkpoint: '/path/to/sgdrive_stage1_world_model.ckpt'
+sgdrive_teacher_config: "/home/data/tuntun/project/LSD/SGDrive/navsim/planning/script/config/common/agent/sgdrive_agent.yaml"
+sgdrive_teacher_checkpoint: "/home/data/tuntun/project/SGDrive-main/premodel/stage2_h20_171.ckpt"
+sgdrive_teacher_vlm_path: "/home/data/tuntun/project/SGDrive-main/premodel/stage1"
+sgdrive_teacher_vlm_type: "internvl_wm"
+
 sgdrive_teacher_feature_keys: ["scene", "agent", "goal"]
 freeze_sgdrive_teacher: True
 teacher_eval_mode: True
-debug_print_teacher_shapes: False
-teacher_feature_source: "cached"   # 可改 online 做在线teacher
+debug_print_teacher_shapes: True
+teacher_feature_source: "online"   # 可改 online 做在线teacher
 
 # student world + distill on
 use_student_world_adapter: True

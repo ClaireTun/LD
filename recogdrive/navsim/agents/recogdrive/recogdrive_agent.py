@@ -23,11 +23,11 @@ from .recogdrive_diffusion_planner import (
     ReCogDriveDiffusionPlannerConfig,
 )
 
-
 from .sgdrive_teacher import FrozenSGDriveTeacher
-from .world_distill import StudentWorldAdapter, StructuralWorldDistillLoss
-
-
+from .world_distill import StudentWorldAdapter, StructuralWorldDistillLoss、
+import ast
+import numpy as np
+from .utils.internvl_preprocess import load_image, build_transform, dynamic_preprocess
 class ReCogDriveAgent(AbstractAgent):
     def __init__(
         self,
@@ -46,10 +46,11 @@ class ReCogDriveAgent(AbstractAgent):
         reference_policy_checkpoint: Optional[str] = '', 
         vlm_size: Optional[str] = 'small', 
         train_backbone: bool = False,
-
         use_sgdrive_teacher: bool = False,
         sgdrive_teacher_config: str = "",
         sgdrive_teacher_checkpoint: str = "",
+        sgdrive_teacher_vlm_path: str = "",
+        sgdrive_teacher_vlm_type: str = "",
         sgdrive_teacher_feature_keys: Optional[List[str]] = None,
         freeze_sgdrive_teacher: bool = True,
         teacher_eval_mode: bool = True,
@@ -108,7 +109,6 @@ class ReCogDriveAgent(AbstractAgent):
         self.reference_policy_checkpoint = reference_policy_checkpoint
         self.vlm_size = vlm_size
         self.train_backbone = train_backbone
-
         self.use_sgdrive_teacher = use_sgdrive_teacher
         self.debug_print_teacher_shapes = debug_print_teacher_shapes
         self.sgdrive_teacher: Optional[FrozenSGDriveTeacher] = None
@@ -152,6 +152,7 @@ class ReCogDriveAgent(AbstractAgent):
             cfg = make_recogdrive_config(self.dit_type, action_dim=3, action_horizon=8, grpo=self.grpo, input_embedding_dim=384,sampling_method=sampling_method)
 
         cfg.vlm_size = self.vlm_size
+        vlm_feature_dim = 3584 if self.vlm_size == "large" else 1536
 
         cfg.use_world_denoise_influence = use_world_denoise_influence
         cfg.world_denoise_influence_type = world_denoise_influence_type
@@ -182,6 +183,8 @@ class ReCogDriveAgent(AbstractAgent):
             self.sgdrive_teacher = FrozenSGDriveTeacher(
                 sgdrive_teacher_config=sgdrive_teacher_config,
                 sgdrive_teacher_checkpoint=sgdrive_teacher_checkpoint,
+                sgdrive_teacher_vlm_path=sgdrive_teacher_vlm_path or vlm_path or "",
+                sgdrive_teacher_vlm_type=sgdrive_teacher_vlm_type or vlm_type or "",
                 sgdrive_teacher_feature_keys=sgdrive_teacher_feature_keys or ["scene", "agent", "goal"],
                 freeze_sgdrive_teacher=freeze_sgdrive_teacher,
                 teacher_eval_mode=teacher_eval_mode,
@@ -189,19 +192,18 @@ class ReCogDriveAgent(AbstractAgent):
             )
         if self.use_student_world_adapter:
             self.student_world_adapter = StudentWorldAdapter(
-                input_dim=cfg.input_embedding_dim,
+                input_dim=vlm_feature_dim,
                 student_world_dim=student_world_dim,
                 student_world_num_tokens=student_world_num_tokens,
                 student_world_use_mlp=student_world_use_mlp,
                 student_world_dropout=student_world_dropout,
             ).cuda()
         if self.use_world_tokens_as_planner_condition:
-            self.world_condition_projector = torch.nn.Linear(student_world_dim, cfg.input_embedding_dim).cuda()
+            self.world_condition_projector = torch.nn.Linear(student_world_dim, vlm_feature_dim).cuda()
             if world_condition_fusion_type == "gated_add":
                 self.world_condition_gate = torch.nn.Parameter(torch.tensor(1.0, device=self.action_head.feature_encoder.weight.device))
             elif world_condition_fusion_type not in ["concat", "gated_add", "cross_attn"]:
                 raise ValueError(f"Unsupported world_condition_fusion_type: {world_condition_fusion_type}")
-
         if self.use_structural_world_distill:
             self.structural_world_distill_loss = StructuralWorldDistillLoss(
                 student_world_dim=student_world_dim,
