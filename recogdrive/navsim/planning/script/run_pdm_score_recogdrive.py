@@ -25,7 +25,7 @@ from navsim.agents.abstract_agent import AbstractAgent
 from navsim.common.dataloader import SceneLoader, SceneFilter, MetricCacheLoader
 from navsim.common.dataclasses import SensorConfig
 from navsim.evaluate.pdm_score import pdm_score
-from navsim.planning.script.builders.worker_pool_builder import build_worker
+#from navsim.planning.script.builders.worker_pool_builder import build_worker
 from navsim.planning.simulation.planner.pdm_planner.simulation.pdm_simulator import PDMSimulator
 from navsim.planning.simulation.planner.pdm_planner.scoring.pdm_scorer import PDMScorer
 from navsim.planning.metric_caching.metric_cache import MetricCache
@@ -177,7 +177,7 @@ def main(cfg: DictConfig) -> None:
     device = torch.device(f'cuda:{local_rank}')
 
     build_logger(cfg)
-    worker = build_worker(cfg)
+    #worker = build_worker(cfg)
 
 
     scene_loader = SceneLoader(

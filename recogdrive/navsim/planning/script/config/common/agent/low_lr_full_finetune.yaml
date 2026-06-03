@@ -1,4 +1,4 @@
-# B1: 预训练 DiT + world distill（无 planner modulation）
+# LatentSight B2: low-LR full/partial VLM finetune + cross-attention projector.
 _target_: navsim.agents.recogdrive.recogdrive_agent.ReCogDriveAgent
 _convert_: 'all'
 
@@ -8,9 +8,8 @@ trajectory_sampling:
   time_horizon: 4
   interval_length: 0.5
 
-checkpoint_path: '/home/data/tuntun/project/LSD/premodel/ReCogDrive_Diffusion_Planner_2B_IL.ckpt'
-
-vlm_path: '/home/data/tuntun/project/SGDrive-main/ReCogDrive-VLM-2B'
+checkpoint_path: '/path/to/pretrained_dit.ckpt'
+vlm_path: '/path/to/ReCogDrive-VLM-2B'
 cam_type: 'single'
 vlm_type: 'internvl'
 dit_type: 'small'
@@ -24,30 +23,28 @@ train_backbone: false
 grpo: False
 lr: 1e-5
 
-# teacher on
 use_sgdrive_teacher: True
-sgdrive_teacher_config: "/home/data/tuntun/project/LSD/SGDrive/navsim/planning/script/config/common/agent/sgdrive_agent.yaml"
-sgdrive_teacher_checkpoint: "/home/data/tuntun/project/SGDrive-main/premodel/stage2_h20_171.ckpt"
-sgdrive_teacher_vlm_path: "/home/data/tuntun/project/SGDrive-main/premodel/stage1"
-sgdrive_teacher_vlm_type: "internvl_wm"
-
+sgdrive_teacher_config: '/path/to/sgdrive_agent.yaml'
+sgdrive_teacher_checkpoint: '/path/to/sgdrive_teacher.ckpt'
+sgdrive_teacher_vlm_path: '/path/to/ReCogDrive-VLM-2B'
+sgdrive_teacher_vlm_type: 'internvl_wm'
 sgdrive_teacher_feature_keys: ["scene", "agent", "goal"]
 freeze_sgdrive_teacher: True
 teacher_eval_mode: True
 debug_print_teacher_shapes: True
-teacher_feature_source: "online"   # 可改 online 做在线teacher
+teacher_feature_source: "cached"
 
-# student world + distill on
 use_student_world_adapter: True
 student_world_dim: 256
-student_world_num_tokens: 1
+student_world_num_tokens: 4
 student_world_use_mlp: True
-student_world_use_cross_attn: False
+student_world_use_cross_attn: True
+student_world_num_heads: 4
 student_world_source: "cognition_tokens"
-student_world_dropout: 0.0
+student_world_dropout: 0.05
 
 use_structural_world_distill: True
-struct_distill_loss_type: "cosine"
+struct_distill_loss_type: "mse_plus_cosine"
 struct_distill_weight: 1.0
 scene_distill_weight: 1.0
 agent_distill_weight: 1.0
@@ -55,23 +52,21 @@ goal_distill_weight: 1.0
 detach_teacher: True
 normalize_distill_features: True
 
-# planner modulation off
 use_world_tokens_as_planner_condition: True
 world_condition_fusion_type: "concat"
 world_condition_detach: False
-world_condition_weight: 0.0
-
-use_world_denoise_influence: False
-world_denoise_influence_type: "cross_attn"
-use_world_denoise_cross_attn: False
-use_world_denoise_film: False
+world_condition_weight: 1.0
+use_world_denoise_influence: True
+world_denoise_influence_type: "cross_attn_plus_film"
+use_world_denoise_cross_attn: True
+use_world_denoise_film: True
 world_denoise_dim: 256
 world_denoise_num_heads: 4
 world_denoise_dropout: 0.0
 world_denoise_use_scene: True
 world_denoise_use_agent: True
 world_denoise_use_goal: True
-world_denoise_pooling: "none"
+world_denoise_pooling: "mean"
 world_denoise_apply_layers: []
 world_denoise_apply_steps: "all"
 world_denoise_custom_steps: []
@@ -79,3 +74,17 @@ world_denoise_residual_scale: 1.0
 world_denoise_gate_init: -2.0
 world_denoise_detach_world_tokens: False
 debug_world_denoise_influence: False
+
+latentsight_train_mode: "low_lr_full_finetune"
+projector_type: "cross_attn"
+hidden_loss_type: "mse_plus_cosine"
+teacher_latent_dim: 256
+projector_num_heads: 4
+projector_dropout: 0.05
+use_paramwise_optimizer: True
+projector_lr: 2e-4
+future_query_lr: 1e-4
+planner_condition_lr: 5e-5
+lora_lr: 1e-4
+vlm_lr: 1e-6
+planner_head_lr: 2e-5

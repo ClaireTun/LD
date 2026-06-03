@@ -5,6 +5,12 @@ from typing import Dict, Tuple,Any
 
 from navsim.agents.abstract_agent import AbstractAgent
 
+from navsim.agents.recogdrive.latentsight_training import grad_norm_by_keywords
+
+import torch
+
+from navsim.agents.recogdrive.latentsight_training import grad_norm_by_keywords
+
 
 class AgentLightningModule(pl.LightningModule):
     """Pytorch lightning wrapper for learnable agent."""
@@ -47,6 +53,25 @@ class AgentLightningModule(pl.LightningModule):
             if not k.startswith('agent.model')
         }
         checkpoint['state_dict'] = filtered_sd
+
+    def on_after_backward(self) -> None:
+        if hasattr(self.agent, "named_parameters"):
+            projector_norm = grad_norm_by_keywords(self.agent, ["teacher_to_token_projector", "structural_world_distill_loss"])
+            lora_norm = grad_norm_by_keywords(self.agent, ["lora_A", "lora_B"])
+            self.log("train/projector_grad_norm", projector_norm, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+            self.log("train/lora_grad_norm", lora_norm, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+
+            unused = [
+                name
+                for name, p in self.agent.named_parameters()
+                if p.requires_grad and p.grad is None and "sgdrive_teacher" not in name
+            ]
+            device = self.device if isinstance(self.device, torch.device) else torch.device("cpu")
+            unused_count = torch.tensor(float(len(unused)), device=device)
+            self.log("train/unused_trainable_param_count", unused_count, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+            if unused and self.global_step == 0 and getattr(self.trainer, "is_global_zero", True):
+                sample = ", ".join(unused[:20])
+                print(f"[LatentSight][WARN] trainable non-teacher params without grad on first backward: count={len(unused)} sample=[{sample}]")
 
     def training_step(self, batch: Tuple[Dict[str, Tensor], Dict[str, Tensor]], batch_idx: int) -> Tensor:
         """
