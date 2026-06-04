@@ -113,12 +113,48 @@ class ReCogDriveAgent(AbstractAgent):
         lora_lr: float = 1e-4,
         vlm_lr: float = 5e-6,
         planner_head_lr: float = 5e-5,
+        optimizer_weight_decay: float = 1e-4,
+        scheduler_epochs: int = 200,
+        scheduler_warmup_epochs: int = 3,
+        enable_teacher: Optional[bool] = None,
+        use_teacher: Optional[bool] = None,
+        use_distill: Optional[bool] = None,
+        use_teacher_distill: Optional[bool] = None,
+        lambda_hidden: Optional[float] = None,
+        use_future_queries: Optional[bool] = None,
+        use_h_future: Optional[bool] = None,
+        use_planner_modulation_from_future: Optional[bool] = None,
+        experiment_tag: str = "",
         lora_r: int = 8,
         lora_alpha: int = 16,
         lora_dropout: float = 0.05,
         lora_target_modules: Optional[List[str]] = None,
     ):
+        
+        if enable_teacher is not None:
+            use_sgdrive_teacher = bool(enable_teacher) and bool(use_sgdrive_teacher)
+        if use_teacher is not None:
+            use_sgdrive_teacher = bool(use_teacher) and bool(use_sgdrive_teacher)
+        if use_distill is not None:
+            use_structural_world_distill = bool(use_distill) and bool(use_structural_world_distill)
+        if use_teacher_distill is not None:
+            use_structural_world_distill = bool(use_teacher_distill) and bool(use_structural_world_distill)
+        if lambda_hidden is not None and float(lambda_hidden) <= 0.0:
+            use_structural_world_distill = False
+            struct_distill_weight = 0.0
+            scene_distill_weight = 0.0
+            agent_distill_weight = 0.0
+            goal_distill_weight = 0.0
+        if use_future_queries is not None:
+            use_student_world_adapter = bool(use_future_queries) and bool(use_student_world_adapter)
+        if use_h_future is not None:
+            use_student_world_adapter = bool(use_h_future) and bool(use_student_world_adapter)
+        if use_planner_modulation_from_future is not None:
+            use_world_tokens_as_planner_condition = bool(use_planner_modulation_from_future) and bool(use_world_tokens_as_planner_condition)
+            use_world_denoise_influence = bool(use_planner_modulation_from_future) and bool(use_world_denoise_influence)
+        
         super().__init__()
+
         self._trajectory_sampling = trajectory_sampling
         self.vlm_path = vlm_path
         self.checkpoint_path = checkpoint_path
@@ -159,7 +195,17 @@ class ReCogDriveAgent(AbstractAgent):
         self.lora_lr = lora_lr
         self.vlm_lr = vlm_lr
         self.planner_head_lr = planner_head_lr
-        self.use_paramwise_optimizer = use_paramwise_optimizer or self.latentsight_train_mode in ["projector_only", "vlm_lora", "low_lr_full_finetune"]
+        #self.use_paramwise_optimizer = use_paramwise_optimizer or self.latentsight_train_mode in ["projector_only", "vlm_lora", "low_lr_full_finetune"]
+        
+        self.optimizer_weight_decay = optimizer_weight_decay
+        self.scheduler_epochs = scheduler_epochs
+        self.scheduler_warmup_epochs = scheduler_warmup_epochs
+        self.experiment_tag = experiment_tag or self.latentsight_train_mode.upper()
+        self.teacher_enabled = bool(self.use_sgdrive_teacher)
+        self.distill_enabled = bool(self.use_structural_world_distill)
+        self.future_queries_enabled = bool(self.use_student_world_adapter)
+        self.use_paramwise_optimizer = use_paramwise_optimizer or self.latentsight_train_mode in ["projector_only", "adapter_only", "vlm_lora", "low_lr_full_finetune"]
+        
         self.lora_cfg = {
             "r": lora_r,
             "alpha": lora_alpha,
@@ -272,6 +318,11 @@ class ReCogDriveAgent(AbstractAgent):
         trainable, total, ratio = set_latentsight_trainable(self, self.latentsight_train_mode, None)
         self.trainable_param_ratio = ratio
 
+        print(
+            f"[LatentSight][Experiment] name={self.experiment_tag} "
+            f"teacher={self.teacher_enabled} future_queries={self.future_queries_enabled} "
+            f"distillation={self.distill_enabled} trainable={trainable:,}/{total:,} ({ratio:.4%})"
+        )
 
         self.num_inference_samples = 1
         self.inference_selection_mode = "median"
@@ -452,34 +503,71 @@ class ReCogDriveAgent(AbstractAgent):
             action_inputs = BatchFeature(data={"state": input_state.to(model_dtype), "his_traj": history_trajectory_reshaped.to(model_dtype), "status_feature": status_feature.to(model_dtype), "action": targets["trajectory"].to(model_dtype)})
             #return self.action_head(last_hidden_state, action_inputs)
             outputs = self.action_head(last_hidden_state, action_inputs, world_tokens=student_world if self.use_student_world_adapter and self.student_world_adapter is not None else None)
-            self.latest_loss_logs = {}
-            self.latest_loss_logs["loss_plan"] = outputs.loss.detach()
-            self.latest_loss_logs["trainable_param_ratio"] = torch.tensor(self.trainable_param_ratio, device=outputs.loss.device)
-            self.latest_loss_logs["world_tokens_used_by_planner"] = torch.tensor(1.0 if self.use_world_tokens_as_planner_condition else 0.0, device=outputs.loss.device)
+            # self.latest_loss_logs = {}
+            # self.latest_loss_logs["loss_plan"] = outputs.loss.detach()
+            # self.latest_loss_logs["trainable_param_ratio"] = torch.tensor(self.trainable_param_ratio, device=outputs.loss.device)
+            # self.latest_loss_logs["world_tokens_used_by_planner"] = torch.tensor(1.0 if self.use_world_tokens_as_planner_condition else 0.0, device=outputs.loss.device)
             
-            struct_logs["loss_plan"] = self.latest_loss_logs["loss_plan"]
-            struct_logs["trainable_param_ratio"] = self.latest_loss_logs["trainable_param_ratio"]
-            struct_logs["projector_grad_norm"] = torch.tensor(0.0, device=loss_struct_total.device)
-            # Save tensors for optional debug/sanity inspection.
-            self.last_h_future = next((v for v in student_world_for_loss.values() if isinstance(v, torch.Tensor)), None)
-            teacher_first = next((v for v in teacher_outputs.values() if isinstance(v, torch.Tensor)), None)
-            self.last_teacher_latent = teacher_first
-            if teacher_first is not None and self.structural_world_distill_loss is not None and self.last_h_future is not None:
-                key_first = next((k for k, v in teacher_outputs.items() if isinstance(v, torch.Tensor)), "scene")
-                self.last_z_teacher = self.structural_world_distill_loss.teacher_to_token_projector[key_first](teacher_first.to(dtype=self.last_h_future.dtype, device=self.last_h_future.device))
+            # struct_logs["loss_plan"] = self.latest_loss_logs["loss_plan"]
+            # struct_logs["trainable_param_ratio"] = self.latest_loss_logs["trainable_param_ratio"]
+            # struct_logs["projector_grad_norm"] = torch.tensor(0.0, device=loss_struct_total.device)
+            # # Save tensors for optional debug/sanity inspection.
+            # self.last_h_future = next((v for v in student_world_for_loss.values() if isinstance(v, torch.Tensor)), None)
+            # teacher_first = next((v for v in teacher_outputs.values() if isinstance(v, torch.Tensor)), None)
+            # self.last_teacher_latent = teacher_first
+            # if teacher_first is not None and self.structural_world_distill_loss is not None and self.last_h_future is not None:
+            #     key_first = next((k for k, v in teacher_outputs.items() if isinstance(v, torch.Tensor)), "scene")
+            #     self.last_z_teacher = self.structural_world_distill_loss.teacher_to_token_projector[key_first](teacher_first.to(dtype=self.last_h_future.dtype, device=self.last_h_future.device))
         
-            if self.use_structural_world_distill and self.training and self.use_sgdrive_teacher and self.sgdrive_teacher is not None and self.student_world_adapter is not None and self.structural_world_distill_loss is not None:
-                teacher_outputs = {
+            # if self.use_structural_world_distill and self.training and self.use_sgdrive_teacher and self.sgdrive_teacher is not None and self.student_world_adapter is not None and self.structural_world_distill_loss is not None:
+            #     teacher_outputs = {            
+            
+            zero = torch.tensor(0.0, device=outputs.loss.device)
+            self.latest_loss_logs = {
+                "loss_plan": outputs.loss.detach(),
+                "total_loss": outputs.loss.detach(),
+                "loss_hidden": zero,
+                "trainable_param_ratio": torch.tensor(self.trainable_param_ratio, device=outputs.loss.device),
+                "world_tokens_used_by_planner": torch.tensor(1.0 if self.use_world_tokens_as_planner_condition else 0.0, device=outputs.loss.device),
+                "teacher_enabled": torch.tensor(1.0 if self.use_sgdrive_teacher else 0.0, device=outputs.loss.device),
+                "distill_enabled": torch.tensor(1.0 if self.use_structural_world_distill else 0.0, device=outputs.loss.device),
+            }
+            if self.use_student_world_adapter and self.student_world_adapter is not None and 'student_world' in locals():
+                self.last_h_future = next((v for v in student_world.values() if isinstance(v, torch.Tensor)), None)
+                if self.last_h_future is not None:
+                    self.latest_loss_logs["H_future_norm"] = self.last_h_future.detach().float().norm(dim=-1).mean()
+            else:
+                self.last_h_future = None
+
+            if self.use_structural_world_distill and self.use_sgdrive_teacher and self.sgdrive_teacher is not None and self.student_world_adapter is not None and self.structural_world_distill_loss is not None:
+                teacher_outputs_for_loss = {
                     "scene": features.get("teacher_scene", None),
                     "agent": features.get("teacher_agent", None),
                     "goal": features.get("teacher_goal", None),
                     "world": features.get("teacher_world", None),
                 }
-                student_world_for_loss = student_world if self.use_student_world_adapter and self.student_world_adapter is not None else self.student_world_adapter(last_hidden_state)
-                loss_struct_total, struct_logs = self.structural_world_distill_loss(student_world_for_loss, teacher_outputs)
-                struct_logs["world_tokens_used_by_planner"] = torch.tensor(1.0 if self.use_world_tokens_as_planner_condition else 0.0, device=loss_struct_total.device)
+                # student_world_for_loss = student_world if self.use_student_world_adapter and self.student_world_adapter is not None else self.student_world_adapter(last_hidden_state)
+                # loss_struct_total, struct_logs = self.structural_world_distill_loss(student_world_for_loss, teacher_outputs)
+                # struct_logs["world_tokens_used_by_planner"] = torch.tensor(1.0 if self.use_world_tokens_as_planner_condition else 0.0, device=loss_struct_total.device)
+                student_world_for_loss = student_world if 'student_world' in locals() else self.student_world_adapter(last_hidden_state)
+                loss_struct_total, struct_logs = self.structural_world_distill_loss(student_world_for_loss, teacher_outputs_for_loss)
                 outputs.loss = outputs.loss + loss_struct_total
+                struct_logs["loss_plan"] = self.latest_loss_logs["loss_plan"]
+                struct_logs["total_loss"] = outputs.loss.detach()
+                struct_logs["trainable_param_ratio"] = self.latest_loss_logs["trainable_param_ratio"]
+                struct_logs["world_tokens_used_by_planner"] = self.latest_loss_logs["world_tokens_used_by_planner"]
+                struct_logs["teacher_enabled"] = self.latest_loss_logs["teacher_enabled"]
+                struct_logs["distill_enabled"] = self.latest_loss_logs["distill_enabled"]
                 self.latest_loss_logs = struct_logs
+                
+                teacher_first = next((v for v in teacher_outputs_for_loss.values() if isinstance(v, torch.Tensor)), None)
+                self.last_teacher_latent = teacher_first
+                if teacher_first is not None and self.last_h_future is not None:
+                    key_first = next((k for k, v in teacher_outputs_for_loss.items() if isinstance(v, torch.Tensor)), "scene")
+                    self.last_z_teacher = self.structural_world_distill_loss.teacher_to_token_projector[key_first](teacher_first.to(dtype=self.last_h_future.dtype, device=self.last_h_future.device))
+            else:
+                self.last_teacher_latent = None
+                self.last_z_teacher = None
             return outputs
         
         elif self.training and self.grpo:
@@ -530,13 +618,47 @@ class ReCogDriveAgent(AbstractAgent):
         else:
             return torch.nn.functional.l1_loss(predictions["pred_traj"], targets["trajectory"])
 
+    # def get_optimizers(self) -> Union[Optimizer, Dict[str, LRScheduler]]:
+    #     optimizer_cfg = DictConfig(dict(type="AdamW", lr=self._lr, weight_decay=1e-4, betas=(0.9, 0.95)))
+
+    #     if self.use_paramwise_optimizer:
+    #         params = build_latentsight_optimizer_groups(self, base_lr=self._lr, weight_decay=1e-4)
+    #         optimizer = build_from_configs(optim, optimizer_cfg, params=params)
+    #         scheduler = WarmupCosLR(optimizer=optimizer, lr=self._lr, min_lr=1e-6, epochs=200, warmup_epochs=3)
+    #         return {'optimizer': optimizer, 'lr_scheduler': scheduler}
+        
+    #     params = list(self.action_head.parameters())
+    #     if self.backbone is not None and self.train_backbone:
+    #         params += list(self.backbone.parameters())
+        
+    #     if self.student_world_adapter is not None:
+    #         params += list(self.student_world_adapter.parameters())
+    #     if self.structural_world_distill_loss is not None:
+    #         params += list(self.structural_world_distill_loss.parameters())
+    #     if self.world_condition_projector is not None:
+    #         params += list(self.world_condition_projector.parameters())
+    #     if self.world_condition_gate is not None:
+    #         params += [self.world_condition_gate]
+
+    #     optimizer = build_from_configs(optim, optimizer_cfg, params=params)
+        
+    #     if self.grpo:
+    #         scheduler = WarmupCosLR(optimizer=optimizer, lr=self._lr, min_lr=0.0, epochs=10, warmup_epochs=0)
+    #     else:
+    #         scheduler = WarmupCosLR(optimizer=optimizer, lr=self._lr, min_lr=1e-6, epochs=200, warmup_epochs=3)
+            
+    #     return {'optimizer': optimizer, 'lr_scheduler': scheduler}
+
     def get_optimizers(self) -> Union[Optimizer, Dict[str, LRScheduler]]:
-        optimizer_cfg = DictConfig(dict(type="AdamW", lr=self._lr, weight_decay=1e-4, betas=(0.9, 0.95)))
+        #optimizer_cfg = DictConfig(dict(type="AdamW", lr=self._lr, weight_decay=1e-4, betas=(0.9, 0.95)))
+        optimizer_cfg = DictConfig(dict(type="AdamW", lr=self._lr, weight_decay=self.optimizer_weight_decay, betas=(0.9, 0.95)))
 
         if self.use_paramwise_optimizer:
-            params = build_latentsight_optimizer_groups(self, base_lr=self._lr, weight_decay=1e-4)
+            #params = build_latentsight_optimizer_groups(self, base_lr=self._lr, weight_decay=1e-4)
+            params = build_latentsight_optimizer_groups(self, base_lr=self._lr, weight_decay=self.optimizer_weight_decay)
             optimizer = build_from_configs(optim, optimizer_cfg, params=params)
-            scheduler = WarmupCosLR(optimizer=optimizer, lr=self._lr, min_lr=1e-6, epochs=200, warmup_epochs=3)
+            #scheduler = WarmupCosLR(optimizer=optimizer, lr=self._lr, min_lr=1e-6, epochs=200, warmup_epochs=3)
+            scheduler = WarmupCosLR(optimizer=optimizer, lr=self._lr, min_lr=1e-6, epochs=self.scheduler_epochs, warmup_epochs=self.scheduler_warmup_epochs)
             return {'optimizer': optimizer, 'lr_scheduler': scheduler}
         
         params = list(self.action_head.parameters())
@@ -557,7 +679,8 @@ class ReCogDriveAgent(AbstractAgent):
         if self.grpo:
             scheduler = WarmupCosLR(optimizer=optimizer, lr=self._lr, min_lr=0.0, epochs=10, warmup_epochs=0)
         else:
-            scheduler = WarmupCosLR(optimizer=optimizer, lr=self._lr, min_lr=1e-6, epochs=200, warmup_epochs=3)
+            #scheduler = WarmupCosLR(optimizer=optimizer, lr=self._lr, min_lr=1e-6, epochs=200, warmup_epochs=3)
+            scheduler = WarmupCosLR(optimizer=optimizer, lr=self._lr, min_lr=1e-6, epochs=self.scheduler_epochs, warmup_epochs=self.scheduler_warmup_epochs)
             
         return {'optimizer': optimizer, 'lr_scheduler': scheduler}
 

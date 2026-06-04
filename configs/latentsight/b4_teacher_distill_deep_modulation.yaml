@@ -1,0 +1,164 @@
+hydra:
+  run:
+    dir: ${output_dir}
+  output_subdir: ${output_dir}/code/hydra
+  searchpath:
+    - pkg://navsim.planning.script.config.common
+    - pkg://navsim.planning.script.config.training
+  job:
+    chdir: False
+
+defaults:
+  - default_common
+  - default_evaluation
+  - default_train_val_test_log_split
+  - _self_
+
+experiment_name: latentsight_v2_b4_teacher_distill_deep_modulation
+split: trainval
+cache_path: ${oc.env:NAVSIM_EXP_ROOT}/training_cache_recogdrive_b4_teacher_distill_deep_modulation
+use_cache_without_dataset: false
+force_cache_computation: false
+seed: 0
+
+use_deepspeed: True
+deepspeed:
+  train_micro_batch_size_per_gpu: 32
+  gradient_accumulation_steps: 1
+  zero_optimization:
+    stage: 1
+    offload_optimizer:
+      device: cpu
+  fp16:
+    enabled: false
+  bf16:
+    enabled: false
+  gradient_clipping: 1.0
+
+dataloader:
+  params:
+    batch_size: 16
+    num_workers: 8
+    pin_memory: true
+    prefetch_factor: 2
+
+trainer:
+  params:
+    max_epochs: 10
+    check_val_every_n_epoch: 1
+    val_check_interval: 1.0
+    limit_train_batches: 1.0
+    limit_val_batches: 1.0
+    accelerator: gpu
+    strategy: ddp
+    precision: 32-true
+    num_nodes: 1
+    devices: 8
+    num_sanity_val_steps: 0
+    fast_dev_run: false
+    accumulate_grad_batches: 1
+    gradient_clip_val: 1.0
+    gradient_clip_algorithm: norm
+    default_root_dir: ${output_dir}
+
+agent:
+  _target_: navsim.agents.recogdrive.recogdrive_agent.ReCogDriveAgent
+  _convert_: 'all'
+  trajectory_sampling:
+    _target_: nuplan.planning.simulation.trajectory.trajectory_sampling.TrajectorySampling
+    _convert_: 'all'
+    time_horizon: 4
+    interval_length: 0.5
+
+  experiment_tag: B4
+  checkpoint_path: ${oc.env:STUDENT_CHECKPOINT,/path/to/student_language_planner.ckpt}
+  vlm_path: ${oc.env:STUDENT_VLM_PATH,/path/to/ReCogDrive-VLM-2B}
+  cam_type: single
+  vlm_type: internvl
+  dit_type: small
+  sampling_method: ddim
+  cache_mode: False
+  cache_hidden_state: False
+  metric_cache_path: ''
+  reference_policy_checkpoint: ''
+  vlm_size: small
+  train_backbone: true
+  grpo: False
+  lr: 1e-5
+
+  enable_teacher: true
+  use_teacher: true
+  use_sgdrive_teacher: true
+  sgdrive_teacher_config: ${oc.env:SGDRIVE_TEACHER_CONFIG,/path/to/sgdrive_agent.yaml}
+  sgdrive_teacher_checkpoint: ${oc.env:SGDRIVE_TEACHER_CHECKPOINT,/path/to/sgdrive_teacher.ckpt}
+  sgdrive_teacher_vlm_path: ${oc.env:SGDRIVE_TEACHER_VLM_PATH,/path/to/SGDrive-VLM}
+  sgdrive_teacher_vlm_type: ${oc.env:SGDRIVE_TEACHER_VLM_TYPE,internvl_wm}
+  sgdrive_teacher_feature_keys: [scene, agent, goal]
+  freeze_sgdrive_teacher: True
+  teacher_eval_mode: True
+  debug_print_teacher_shapes: False
+  teacher_feature_source: online
+
+  use_future_queries: true
+  use_h_future: true
+  use_student_world_adapter: true
+  student_world_dim: 256
+  student_world_num_tokens: 4
+  student_world_use_mlp: True
+  student_world_use_cross_attn: True
+  student_world_num_heads: 4
+  student_world_source: cognition_tokens
+  student_world_dropout: 0.05
+
+  use_distill: true
+  use_teacher_distill: true
+  use_structural_world_distill: true
+  lambda_hidden: 1.0
+  struct_distill_loss_type: mse_plus_cosine
+  struct_distill_weight: 1.0
+  scene_distill_weight: 1.0
+  agent_distill_weight: 1.0
+  goal_distill_weight: 1.0
+  detach_teacher: True
+  normalize_distill_features: True
+
+  use_planner_modulation_from_future: true
+  use_world_tokens_as_planner_condition: true
+  world_condition_fusion_type: concat
+  world_condition_detach: False
+  world_condition_weight: 1.0
+  use_world_denoise_influence: true
+  world_denoise_influence_type: cross_attn_plus_film
+  use_world_denoise_cross_attn: true
+  use_world_denoise_film: true
+  world_denoise_dim: 256
+  world_denoise_num_heads: 4
+  world_denoise_dropout: 0.0
+  world_denoise_use_scene: True
+  world_denoise_use_agent: True
+  world_denoise_use_goal: True
+  world_denoise_pooling: mean
+  world_denoise_apply_layers: []
+  world_denoise_apply_steps: all
+  world_denoise_custom_steps: []
+  world_denoise_residual_scale: 1.0
+  world_denoise_gate_init: -2.0
+  world_denoise_detach_world_tokens: False
+  debug_world_denoise_influence: False
+
+  latentsight_train_mode: low_lr_full_finetune
+  projector_type: cross_attn
+  hidden_loss_type: mse_plus_cosine
+  teacher_latent_dim: 256
+  projector_num_heads: 4
+  projector_dropout: 0.0
+  use_paramwise_optimizer: True
+  optimizer_weight_decay: 0.01
+  scheduler_epochs: 10
+  scheduler_warmup_epochs: 1
+  projector_lr: 1e-4
+  future_query_lr: 1e-4
+  planner_condition_lr: 5e-5
+  lora_lr: 0.0
+  vlm_lr: 1e-6
+  planner_head_lr: 1e-5

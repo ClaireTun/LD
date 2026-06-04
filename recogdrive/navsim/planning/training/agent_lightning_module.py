@@ -58,9 +58,20 @@ class AgentLightningModule(pl.LightningModule):
         if hasattr(self.agent, "named_parameters"):
             projector_norm = grad_norm_by_keywords(self.agent, ["teacher_to_token_projector", "structural_world_distill_loss"])
             lora_norm = grad_norm_by_keywords(self.agent, ["lora_A", "lora_B"])
+            future_query_norm = grad_norm_by_keywords(self.agent, ["future_queries", "student_world_adapter"])
+            modulation_norm = grad_norm_by_keywords(self.agent, ["world_condition", "world_denoise_modulator"])
+            planner_norm = grad_norm_by_keywords(self.agent, ["action_head"])
+            vlm_norm = grad_norm_by_keywords(self.agent, ["backbone"])
+            all_norm = grad_norm_by_keywords(self.agent, [""])
             self.log("train/projector_grad_norm", projector_norm, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
             self.log("train/lora_grad_norm", lora_norm, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
 
+            self.log("train/future_query_grad_norm", future_query_norm, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+            self.log("train/modulation_grad_norm", modulation_norm, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+            self.log("train/planner_grad_norm", planner_norm, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+            self.log("train/vlm_grad_norm", vlm_norm, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+            self.log("train/grad_norm", all_norm, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+            
             unused = [
                 name
                 for name, p in self.agent.named_parameters()
@@ -90,6 +101,20 @@ class AgentLightningModule(pl.LightningModule):
         :return: scalar loss
         """
         return self._step(batch, "val")
+    
+    def optimizer_step(self, *args: Any, **kwargs: Any) -> None:
+        super().optimizer_step(*args, **kwargs)
+        if self.trainer is None or not self.trainer.optimizers:
+            return
+        optimizer = self.trainer.optimizers[0]
+        group_lrs = {group.get("name", f"group_{idx}"): group.get("lr", 0.0) for idx, group in enumerate(optimizer.param_groups)}
+        device = self.device if isinstance(self.device, torch.device) else torch.device("cpu")
+        self.log("train/lr_vlm", torch.tensor(float(group_lrs.get("vlm", 0.0)), device=device), on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+        self.log("train/lr_planner", torch.tensor(float(group_lrs.get("planner_head", group_lrs.get("other", 0.0))), device=device), on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+        if "future_queries" in group_lrs:
+            self.log("train/lr_future_queries", torch.tensor(float(group_lrs["future_queries"]), device=device), on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+        if "planner_condition" in group_lrs:
+            self.log("train/lr_modulation", torch.tensor(float(group_lrs["planner_condition"]), device=device), on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
 
     def configure_optimizers(self):
         """Inherited, see superclass."""

@@ -173,6 +173,10 @@ def main(cfg: DictConfig) -> None:
     logger.info("Building Agent")
     agent: AbstractAgent = instantiate(cfg.agent)
 
+    if getattr(agent, "checkpoint_path", None):
+        logger.info("Initializing agent from checkpoint: %s", getattr(agent, "checkpoint_path", None))
+        agent.initialize()
+
     logger.info("Building Lightning Module")
     lightning_module = AgentLightningModule(
         agent=agent,
@@ -213,13 +217,14 @@ def main(cfg: DictConfig) -> None:
 
     trainer_params = cfg.trainer.params
     latentsight_mode = str(getattr(cfg.agent, "latentsight_train_mode", "legacy")).replace("-", "_")
-    if latentsight_mode == "low_lr_full_finetune" and str(getattr(trainer_params, "strategy", "")) == "ddp":
+    #if latentsight_mode == "low_lr_full_finetune" and str(getattr(trainer_params, "strategy", "")) == "ddp":
         # Full/partial VLM finetuning can intentionally leave some modules unused
         # on a given step (for example optional world modulation branches or frozen
         # teacher/distillation-only paths). Lightning DDP otherwise raises
         # "parameters that were not used in producing the loss". Restrict the
         # slower unused-parameter detection to this memory-heavy mode instead of
         # changing the global default for all agents.
+    if latentsight_mode in ["low_lr_full_finetune", "vlm_lora"] and str(getattr(trainer_params, "strategy", "")) == "ddp":
         trainer_params.strategy = "ddp_find_unused_parameters_true"
         logger.info("latentsight_train_mode=%s: using trainer strategy=%s", latentsight_mode, trainer_params.strategy)
     trainer = pl.Trainer(**trainer_params, callbacks=[pl.callbacks.ModelCheckpoint(monitor="val/loss_epoch",mode='min', save_top_k=5,every_n_epochs=1)])
