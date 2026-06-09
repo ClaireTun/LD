@@ -34,6 +34,8 @@ from .latentsight_training import (
     set_latentsight_trainable,
 )
 
+from .plugins.three_stage_distill import build_imagination_distiller, ThreeStageImaginationDistiller
+
 class ReCogDriveAgent(AbstractAgent):
     def __init__(
         self,
@@ -124,6 +126,23 @@ class ReCogDriveAgent(AbstractAgent):
         use_future_queries: Optional[bool] = None,
         use_h_future: Optional[bool] = None,
         use_planner_modulation_from_future: Optional[bool] = None,
+
+        use_three_stage_distill: bool = False,
+        distill_stage1_epochs: int = 2,
+        distill_stage1_iters: int = -1,
+        distill_stage2_end_epochs: int = 7,
+        lambda_init: float = 1.0,
+        lambda_corr: float = 1.0,
+        lambda_cons: float = 0.1,
+        lambda_teacher_min: float = 0.0,
+        teacher_decay_type: str = "linear",
+        beta_cos: float = 0.5,
+        use_soft_intervention: bool = True,
+        use_uncertainty: bool = False,
+        use_self_consistency: bool = False,
+        use_counterfactual_gain: bool = False,
+        use_failure_type_attribution: bool = False,
+
         experiment_tag: str = "",
         lora_r: int = 8,
         lora_alpha: int = 16,
@@ -216,6 +235,31 @@ class ReCogDriveAgent(AbstractAgent):
         self.last_teacher_latent = None
         self.last_z_teacher = None
         self.last_h_future = None
+
+        self.use_three_stage_distill = bool(use_three_stage_distill)
+        self.current_distill_epoch = 0
+        self.current_distill_iter = 0
+        self.three_stage_distiller: Optional[ThreeStageImaginationDistiller] = None
+        if self.use_three_stage_distill:
+            self.three_stage_distiller = build_imagination_distiller(
+                {
+                    "use_three_stage_distill": True,
+                    "stage1_epochs": distill_stage1_epochs,
+                    "stage1_iters": distill_stage1_iters,
+                    "stage2_end_epochs": distill_stage2_end_epochs,
+                    "lambda_init": lambda_init,
+                    "lambda_corr": lambda_corr,
+                    "lambda_cons": lambda_cons,
+                    "lambda_teacher_min": lambda_teacher_min,
+                    "teacher_decay_type": teacher_decay_type,
+                    "beta_cos": beta_cos,
+                    "use_soft_intervention": use_soft_intervention,
+                    "use_uncertainty": use_uncertainty,
+                    "use_self_consistency": use_self_consistency,
+                    "use_counterfactual_gain": use_counterfactual_gain,
+                    "use_failure_type_attribution": use_failure_type_attribution,
+                }
+            )
 
         local_rank = int(os.getenv("LOCAL_RANK", "0"))
         device = f"cuda:{local_rank}"
@@ -550,21 +594,86 @@ class ReCogDriveAgent(AbstractAgent):
                 # loss_struct_total, struct_logs = self.structural_world_distill_loss(student_world_for_loss, teacher_outputs)
                 # struct_logs["world_tokens_used_by_planner"] = torch.tensor(1.0 if self.use_world_tokens_as_planner_condition else 0.0, device=loss_struct_total.device)
                 student_world_for_loss = student_world if 'student_world' in locals() else self.student_world_adapter(last_hidden_state)
-                loss_struct_total, struct_logs = self.structural_world_distill_loss(student_world_for_loss, teacher_outputs_for_loss)
-                outputs.loss = outputs.loss + loss_struct_total
-                struct_logs["loss_plan"] = self.latest_loss_logs["loss_plan"]
-                struct_logs["total_loss"] = outputs.loss.detach()
-                struct_logs["trainable_param_ratio"] = self.latest_loss_logs["trainable_param_ratio"]
-                struct_logs["world_tokens_used_by_planner"] = self.latest_loss_logs["world_tokens_used_by_planner"]
-                struct_logs["teacher_enabled"] = self.latest_loss_logs["teacher_enabled"]
-                struct_logs["distill_enabled"] = self.latest_loss_logs["distill_enabled"]
-                self.latest_loss_logs = struct_logs
+                # loss_struct_total, struct_logs = self.structural_world_distill_loss(student_world_for_loss, teacher_outputs_for_loss)
+                # outputs.loss = outputs.loss + loss_struct_total
+                # struct_logs["loss_plan"] = self.latest_loss_logs["loss_plan"]
+                # struct_logs["total_loss"] = outputs.loss.detach()
+                # struct_logs["trainable_param_ratio"] = self.latest_loss_logs["trainable_param_ratio"]
+                # struct_logs["world_tokens_used_by_planner"] = self.latest_loss_logs["world_tokens_used_by_planner"]
+                # struct_logs["teacher_enabled"] = self.latest_loss_logs["teacher_enabled"]
+                # struct_logs["distill_enabled"] = self.latest_loss_logs["distill_enabled"]
+                # self.latest_loss_logs = struct_logs
                 
                 teacher_first = next((v for v in teacher_outputs_for_loss.values() if isinstance(v, torch.Tensor)), None)
                 self.last_teacher_latent = teacher_first
                 if teacher_first is not None and self.last_h_future is not None:
                     key_first = next((k for k, v in teacher_outputs_for_loss.items() if isinstance(v, torch.Tensor)), "scene")
-                    self.last_z_teacher = self.structural_world_distill_loss.teacher_to_token_projector[key_first](teacher_first.to(dtype=self.last_h_future.dtype, device=self.last_h_future.device))
+                    #self.last_z_teacher = self.structural_world_distill_loss.teacher_to_token_projector[key_first](teacher_first.to(dtype=self.last_h_future.dtype, device=self.last_h_future.device))
+                    self.last_z_teacher = self.structural_world_distill_loss.teacher_to_token_projector[key_first](
+                        teacher_first.to(dtype=self.last_h_future.dtype, device=self.last_h_future.device)
+                    )
+
+                if self.use_three_stage_distill and self.three_stage_distiller is not None:
+                    traj_pred = None
+                    with torch.no_grad():
+                        try:
+                            sampled = self.action_head.get_action(
+                                last_hidden_state.detach().to(model_dtype),
+                                BatchFeature({
+                                    "state": input_state.detach().to(model_dtype),
+                                    "his_traj": history_trajectory_reshaped.detach().to(model_dtype),
+                                    "status_feature": status_feature.detach().to(model_dtype),
+                                }),
+                                deterministic=True,
+                                world_tokens=student_world_for_loss if self.use_student_world_adapter else None,
+                            )
+                            traj_pred = sampled.get("pred_traj", None)
+                        except Exception as exc:  # keep the plugin non-invasive if sampling is unavailable
+                            if self.debug_print_teacher_shapes:
+                                print(f"[LatentSight][ThreeStage][WARN] skipped traj sampling for failure score: {exc}")
+                    teacher_requires_grad_count = sum(
+                        1 for p in self.sgdrive_teacher.parameters() if p.requires_grad
+                    ) if self.sgdrive_teacher is not None else 0
+                    distill_losses, distill_logs = self.three_stage_distiller(
+                        h_future=self.last_h_future,
+                        z_teacher=self.last_z_teacher,
+                        traj_pred=traj_pred,
+                        traj_gt=targets.get("trajectory") if isinstance(targets, dict) else None,
+                        h_future_aug=features.get("H_future_aug", None),
+                        h_future_ref=features.get("H_future_ref", None),
+                        extras={**features, **(targets if isinstance(targets, dict) else {})},
+                        epoch=int(getattr(self, "current_distill_epoch", 0)),
+                        iteration=int(getattr(self, "current_distill_iter", 0)),
+                        teacher_enabled=self.use_sgdrive_teacher,
+                        teacher_requires_grad_count=teacher_requires_grad_count,
+                    )
+                    loss_three_stage = (
+                        distill_losses["loss_hidden"]
+                        + distill_losses["loss_corrective"]
+                        + distill_losses["loss_consistency"]
+                    )
+                    outputs.loss = outputs.loss + loss_three_stage
+                    distill_logs["loss_plan"] = self.latest_loss_logs["loss_plan"]
+                    distill_logs["loss_total"] = outputs.loss.detach()
+                    distill_logs["total_loss"] = outputs.loss.detach()
+                    distill_logs["loss_hidden"] = distill_losses["loss_hidden"].detach()
+                    distill_logs["loss_corrective_weighted"] = distill_losses["loss_corrective"].detach()
+                    distill_logs["loss_consistency_weighted"] = distill_losses["loss_consistency"].detach()
+                    distill_logs["trainable_param_ratio"] = self.latest_loss_logs["trainable_param_ratio"]
+                    distill_logs["world_tokens_used_by_planner"] = self.latest_loss_logs["world_tokens_used_by_planner"]
+                    distill_logs["distill_enabled"] = self.latest_loss_logs["distill_enabled"]
+                    self.latest_loss_logs = distill_logs
+                else:
+                    loss_struct_total, struct_logs = self.structural_world_distill_loss(student_world_for_loss, teacher_outputs_for_loss)
+                    outputs.loss = outputs.loss + loss_struct_total
+                    struct_logs["loss_plan"] = self.latest_loss_logs["loss_plan"]
+                    struct_logs["total_loss"] = outputs.loss.detach()
+                    struct_logs["loss_total"] = outputs.loss.detach()
+                    struct_logs["trainable_param_ratio"] = self.latest_loss_logs["trainable_param_ratio"]
+                    struct_logs["world_tokens_used_by_planner"] = self.latest_loss_logs["world_tokens_used_by_planner"]
+                    struct_logs["teacher_enabled"] = self.latest_loss_logs["teacher_enabled"]
+                    struct_logs["distill_enabled"] = self.latest_loss_logs["distill_enabled"]
+                    self.latest_loss_logs = struct_logs
             else:
                 self.last_teacher_latent = None
                 self.last_z_teacher = None

@@ -31,6 +31,12 @@ class AgentLightningModule(pl.LightningModule):
         :return: scalar loss
         """
         features, targets, tokens_list = batch
+
+        if hasattr(self.agent, "current_distill_epoch"):
+            self.agent.current_distill_epoch = int(getattr(self, "current_epoch", 0))
+        if hasattr(self.agent, "current_distill_iter"):
+            self.agent.current_distill_iter = int(getattr(self, "global_step", 0))
+
         prediction = self.agent.forward(features,targets,tokens_list)
         #prediction = self.agent.forward(features,targets)
         loss = self.agent.compute_loss(features, targets, prediction)
