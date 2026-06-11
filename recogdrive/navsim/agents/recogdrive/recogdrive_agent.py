@@ -114,6 +114,7 @@ class ReCogDriveAgent(AbstractAgent):
         planner_condition_lr: float = 5e-5,
         lora_lr: float = 1e-4,
         vlm_lr: float = 5e-6,
+        llm_lr: Optional[float] = None,
         planner_head_lr: float = 5e-5,
         optimizer_weight_decay: float = 1e-4,
         scheduler_epochs: int = 200,
@@ -213,6 +214,7 @@ class ReCogDriveAgent(AbstractAgent):
         self.planner_condition_lr = planner_condition_lr
         self.lora_lr = lora_lr
         self.vlm_lr = vlm_lr
+        self.llm_lr = vlm_lr if llm_lr is None else llm_lr
         self.planner_head_lr = planner_head_lr
         #self.use_paramwise_optimizer = use_paramwise_optimizer or self.latentsight_train_mode in ["projector_only", "vlm_lora", "low_lr_full_finetune"]
         
@@ -223,8 +225,19 @@ class ReCogDriveAgent(AbstractAgent):
         self.teacher_enabled = bool(self.use_sgdrive_teacher)
         self.distill_enabled = bool(self.use_structural_world_distill)
         self.future_queries_enabled = bool(self.use_student_world_adapter)
-        self.use_paramwise_optimizer = use_paramwise_optimizer or self.latentsight_train_mode in ["projector_only", "adapter_only", "vlm_lora", "low_lr_full_finetune"]
+        #self.use_paramwise_optimizer = use_paramwise_optimizer or self.latentsight_train_mode in ["projector_only", "adapter_only", "vlm_lora", "low_lr_full_finetune"]
         
+        paramwise_modes = [
+            "projector_only",
+            "adapter_only",
+            "vlm_lora",
+            "low_lr_full_finetune",
+            "llm_planner_finetune",
+            "freeze_vit_projector_train_llm_planner",
+        ]
+        self.use_paramwise_optimizer = use_paramwise_optimizer or self.latentsight_train_mode in paramwise_modes
+
+
         self.lora_cfg = {
             "r": lora_r,
             "alpha": lora_alpha,

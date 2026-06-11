@@ -332,6 +332,26 @@ def _set_named_modules_trainable(model: nn.Module, keywords: Sequence[str], trai
         if any(k in name for k in keywords):
             p.requires_grad = trainable
 
+def _get_nested_module(root: nn.Module, module_path: str) -> Optional[nn.Module]:
+    current: Any = root
+    for part in module_path.split("."):
+        if current is None or not hasattr(current, part):
+            return None
+        current = getattr(current, part)
+    return current if isinstance(current, nn.Module) else None
+
+
+def _set_named_submodules_trainable(model: nn.Module, module_paths: Sequence[str], trainable: bool = True) -> List[str]:
+    matched: List[str] = []
+    for module_path in module_paths:
+        module = _get_nested_module(model, module_path)
+        if module is None:
+            continue
+        for p in module.parameters():
+            p.requires_grad = trainable
+        matched.append(module_path)
+    return matched
+
 
 def _print_module_grad_state(model: nn.Module) -> None:
     rows = []
@@ -375,6 +395,12 @@ def set_v2_finetune_mode(model: nn.Module, mode: str, cfg: Optional[Any] = None)
     new_module_keywords = future_query_keywords + distill_projector_keywords + planner_condition_keywords
     planner_keywords = ("action_head",)
     vlm_keywords = ("backbone",)
+
+    llm_module_paths = ("backbone.model.language_model",)
+    planner_module_paths = ("action_head",)
+    vit_module_paths = ("backbone.model.vision_model",)
+    vlm_projector_module_paths = ("backbone.model.mlp1",)
+
     lora_keywords = ("lora_A", "lora_B")
 
     if mode == "projector_only":
@@ -397,10 +423,54 @@ def set_v2_finetune_mode(model: nn.Module, mode: str, cfg: Optional[Any] = None)
         # Generic full-student policy: train VLM/planner plus whichever optional
         # query/projector/modulation modules were actually constructed by YAML.
         _set_named_modules_trainable(model, new_module_keywords + planner_keywords + vlm_keywords, True)
+    
+    # elif mode in ("llm_planner_finetune", "freeze_vit_projector_train_llm_planner"):
+    #     # Exact module paths for the current InternVL-based ReCogDrive backbone:
+    #     # ReCogDriveAgent.backbone -> RecogDriveBackbone.model -> InternVLChatModel.
+    #     # We fail fast if the required LLM/planner modules are absent instead of
+    #     # silently training only a subset due to a stale keyword.
+    #     matched_llm = _set_named_submodules_trainable(model, llm_module_paths, True)
+    #     matched_planner = _set_named_submodules_trainable(model, planner_module_paths, True)
+    #     _set_named_submodules_trainable(model, vit_module_paths + vlm_projector_module_paths, False)
+    #     _set_named_modules_trainable(model, new_module_keywords, False)
+    #     if not matched_llm:
+    #         raise ValueError(
+    #             "LatentSight mode freeze_vit_projector_train_llm_planner requires "
+    #             "InternVL language module path 'backbone.model.language_model', "
+    #             "but it was not found. Check RecogDriveBackbone/AutoModel module names."
+    #         )
+    #     if not matched_planner:
+    #         raise ValueError("LatentSight mode freeze_vit_projector_train_llm_planner requires planner module 'action_head'.")
+    #     print(f"[LatentSight][Trainable] llm/planner mode matched_llm={matched_llm} matched_planner={matched_planner}")
+
+    elif mode in ("llm_planner_finetune", "freeze_vit_projector_train_llm_planner"):
+        # Freeze only the visual side of the VLM (ViT + visual-to-LLM projector).
+        # Keep LLM, planner, and any enabled LatentSight carrier/condition/distill
+        # modules trainable so B2 query carriers can still learn from trajectory loss.
+        _set_named_modules_trainable(model, new_module_keywords + planner_keywords + vlm_keywords, True)
+        matched_llm = _set_named_submodules_trainable(model, llm_module_paths, True)
+        matched_planner = _set_named_submodules_trainable(model, planner_module_paths, True)
+        frozen_visual = _set_named_submodules_trainable(model, vit_module_paths + vlm_projector_module_paths, False)
+        if not matched_llm:
+            raise ValueError(
+                "LatentSight mode freeze_vit_projector_train_llm_planner requires "
+                "InternVL language module path 'backbone.model.language_model', "
+                "but it was not found. Check RecogDriveBackbone/AutoModel module names."
+            )
+        if not matched_planner:
+            raise ValueError("LatentSight mode freeze_vit_projector_train_llm_planner requires planner module 'action_head'.")
+        print(
+            f"[LatentSight][Trainable] freeze visual mode matched_llm={matched_llm} "
+            f"matched_planner={matched_planner} frozen_visual={frozen_visual}"
+        )
+    
     else:
         raise ValueError(
             f"Unsupported LatentSight trainable mode: {mode}. "
-            "Use one of: projector_only, adapter_only, vlm_lora, low_lr_full_finetune."
+            #"Use one of: projector_only, adapter_only, vlm_lora, low_lr_full_finetune."
+            "Use one of: projector_only, adapter_only, vlm_lora, "
+            "low_lr_full_finetune, llm_planner_finetune, "
+            "freeze_vit_projector_train_llm_planner."
         )
 
     freeze_teacher(model)
@@ -425,6 +495,7 @@ def build_latentsight_optimizer_groups(model: nn.Module, base_lr: float, weight_
         ("future_queries", ("future_queries", "student_world_adapter"), getattr(model, "future_query_lr", 1e-4)),
         ("planner_condition", ("world_condition", "world_denoise_modulator"), getattr(model, "planner_condition_lr", 5e-5)),
         ("lora", ("lora_A", "lora_B"), getattr(model, "lora_lr", 1e-4)),
+        ("llm", ("backbone.model.language_model",), getattr(model, "llm_lr", getattr(model, "vlm_lr", 5e-6))),
         ("vlm", ("backbone",), getattr(model, "vlm_lr", 5e-6)),
         ("planner_head", ("action_head",), getattr(model, "planner_head_lr", 5e-5)),
     ]

@@ -224,7 +224,15 @@ def main(cfg: DictConfig) -> None:
         # "parameters that were not used in producing the loss". Restrict the
         # slower unused-parameter detection to this memory-heavy mode instead of
         # changing the global default for all agents.
-    if latentsight_mode in ["low_lr_full_finetune", "vlm_lora"] and str(getattr(trainer_params, "strategy", "")) == "ddp":
+    #if latentsight_mode in ["low_lr_full_finetune", "vlm_lora"] and str(getattr(trainer_params, "strategy", "")) == "ddp":
+    ddp_unused_param_modes = [
+        "low_lr_full_finetune",
+        "vlm_lora",
+        "llm_planner_finetune",
+        "freeze_vit_projector_train_llm_planner",
+    ]
+    if latentsight_mode in ddp_unused_param_modes and str(getattr(trainer_params, "strategy", "")) == "ddp":   
+        
         trainer_params.strategy = "ddp_find_unused_parameters_true"
         logger.info("latentsight_train_mode=%s: using trainer strategy=%s", latentsight_mode, trainer_params.strategy)
     trainer = pl.Trainer(**trainer_params, callbacks=[pl.callbacks.ModelCheckpoint(monitor="val/loss_epoch",mode='min', save_top_k=5,every_n_epochs=1)])
