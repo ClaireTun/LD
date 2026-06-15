@@ -35,6 +35,7 @@ from .latentsight_training import (
 )
 
 from .plugins.three_stage_distill import build_imagination_distiller, ThreeStageImaginationDistiller
+from .drivemem import DriveMemModule
 
 class ReCogDriveAgent(AbstractAgent):
     def __init__(
@@ -116,6 +117,8 @@ class ReCogDriveAgent(AbstractAgent):
         vlm_lr: float = 5e-6,
         llm_lr: Optional[float] = None,
         planner_head_lr: float = 5e-5,
+        drivemem_lr: float = 1e-4,
+        drivemem: Optional[Dict[str, Any]] = None,
         optimizer_weight_decay: float = 1e-4,
         scheduler_epochs: int = 200,
         scheduler_warmup_epochs: int = 3,
@@ -216,6 +219,9 @@ class ReCogDriveAgent(AbstractAgent):
         self.vlm_lr = vlm_lr
         self.llm_lr = vlm_lr if llm_lr is None else llm_lr
         self.planner_head_lr = planner_head_lr
+        self.drivemem_lr = drivemem_lr
+        self.drivemem_cfg = OmegaConf.to_container(drivemem, resolve=True) if isinstance(drivemem, DictConfig) else (dict(drivemem) if isinstance(drivemem, dict) else {})
+        self.drivemem: Optional[DriveMemModule] = None
         #self.use_paramwise_optimizer = use_paramwise_optimizer or self.latentsight_train_mode in ["projector_only", "vlm_lora", "low_lr_full_finetune"]
         
         self.optimizer_weight_decay = optimizer_weight_decay
@@ -326,6 +332,14 @@ class ReCogDriveAgent(AbstractAgent):
             cfg.grpo_cfg.reference_policy_checkpoint = self.reference_policy_checkpoint
             
         self.action_head = ReCogDriveDiffusionPlanner(cfg).cuda()
+        if bool(self.drivemem_cfg.get("enabled", False)):
+            if bool(self.drivemem_cfg.get("use_dsu_main_path", False)):
+                raise ValueError("DriveMem config must keep use_dsu_main_path=False; DSU is side-branch only.")
+            self.drivemem = DriveMemModule(
+                input_dim=vlm_feature_dim,
+                planner_dim=vlm_feature_dim,
+                cfg=self.drivemem_cfg,
+            ).cuda()
         
         if self.use_sgdrive_teacher:
             self.sgdrive_teacher = FrozenSGDriveTeacher(
@@ -556,6 +570,17 @@ class ReCogDriveAgent(AbstractAgent):
             features["teacher_goal"] = teacher_outputs.get("goal")
             features["teacher_world"] = teacher_outputs.get("world")
 
+        drivemem_losses: Dict[str, torch.Tensor] = {}
+        drivemem_logs: Dict[str, torch.Tensor] = {}
+        if self.drivemem is not None and bool(self.drivemem_cfg.get("enabled", False)):
+            # DriveMem reads the clean online/fallback hidden states through a side branch.
+            # DSU is applied inside DriveMem only during training and never replaces z_plan.
+            last_hidden_state, drivemem_losses, drivemem_logs = self.drivemem(
+                z_plan=last_hidden_state,
+                side_features=last_hidden_state,
+                per_sample_loss=None,
+            )
+
         if self.training and not self.grpo:
             action_inputs = BatchFeature(data={"state": input_state.to(model_dtype), "his_traj": history_trajectory_reshaped.to(model_dtype), "status_feature": status_feature.to(model_dtype), "action": targets["trajectory"].to(model_dtype)})
             #return self.action_head(last_hidden_state, action_inputs)
@@ -589,6 +614,16 @@ class ReCogDriveAgent(AbstractAgent):
                 "teacher_enabled": torch.tensor(1.0 if self.use_sgdrive_teacher else 0.0, device=outputs.loss.device),
                 "distill_enabled": torch.tensor(1.0 if self.use_structural_world_distill else 0.0, device=outputs.loss.device),
             }
+            if drivemem_losses:
+                loss_drivemem_total = sum(drivemem_losses.values())
+                outputs.loss = outputs.loss + loss_drivemem_total
+                self.latest_loss_logs["loss_drivemem"] = loss_drivemem_total.detach()
+                self.latest_loss_logs["total_loss"] = outputs.loss.detach()
+                for _k, _v in drivemem_losses.items():
+                    self.latest_loss_logs[_k] = _v.detach()
+            for _k, _v in drivemem_logs.items():
+                if isinstance(_v, torch.Tensor) and _v.numel() == 1:
+                    self.latest_loss_logs[f"drivemem_{_k}"] = _v.detach()
             if self.use_student_world_adapter and self.student_world_adapter is not None and 'student_world' in locals():
                 self.last_h_future = next((v for v in student_world.values() if isinstance(v, torch.Tensor)), None)
                 if self.last_h_future is not None:
@@ -690,6 +725,17 @@ class ReCogDriveAgent(AbstractAgent):
             else:
                 self.last_teacher_latent = None
                 self.last_z_teacher = None
+            # Preserve DriveMem diagnostics even when teacher/structural distillation
+            # replaces latest_loss_logs above. The loss itself is already additive.
+            if drivemem_losses:
+                self.latest_loss_logs["loss_drivemem"] = sum(drivemem_losses.values()).detach()
+                self.latest_loss_logs["total_loss"] = outputs.loss.detach()
+                self.latest_loss_logs["loss_total"] = outputs.loss.detach()
+                for _k, _v in drivemem_losses.items():
+                    self.latest_loss_logs[_k] = _v.detach()
+            for _k, _v in drivemem_logs.items():
+                if isinstance(_v, torch.Tensor) and _v.numel() == 1:
+                    self.latest_loss_logs[f"drivemem_{_k}"] = _v.detach()
             return outputs
         
         elif self.training and self.grpo:
@@ -795,6 +841,8 @@ class ReCogDriveAgent(AbstractAgent):
             params += list(self.world_condition_projector.parameters())
         if self.world_condition_gate is not None:
             params += [self.world_condition_gate]
+        if self.drivemem is not None:
+            params += list(self.drivemem.parameters())
 
         optimizer = build_from_configs(optim, optimizer_cfg, params=params)
         
