@@ -1,0 +1,211 @@
+hydra:
+  run:
+    dir: ${output_dir}
+  output_subdir: ${output_dir}/code/hydra
+  searchpath:
+    - pkg://navsim.planning.script.config.common
+    - pkg://navsim.planning.script.config.training
+  job:
+    chdir: False
+
+defaults:
+  - default_common
+  - default_evaluation
+  - default_train_val_test_log_split
+  - _self_
+
+experiment_name: latentsight_v2_b1_drivemem_freeze_vit_projector
+split: trainval
+cache_path: ""
+use_cache_without_dataset: false
+force_cache_computation: false
+seed: 0
+
+use_deepspeed: True
+deepspeed:
+  train_micro_batch_size_per_gpu: 32
+  gradient_accumulation_steps: 1
+  zero_optimization:
+    stage: 1
+    offload_optimizer:
+      device: cpu
+  fp16:
+    enabled: false
+  bf16:
+    enabled: false
+  gradient_clipping: 1.0
+
+dataloader:
+  params:
+    batch_size: 16
+    num_workers: 8
+    pin_memory: true
+    prefetch_factor: 2
+
+trainer:
+  params:
+    max_epochs: 10
+    check_val_every_n_epoch: 1
+    val_check_interval: 1.0
+    limit_train_batches: 1.0
+    limit_val_batches: 1.0
+    accelerator: gpu
+    strategy: ddp
+    precision: 32-true
+    num_nodes: 1
+    devices: 8
+    num_sanity_val_steps: 0
+    fast_dev_run: false
+    accumulate_grad_batches: 1
+    gradient_clip_val: 1.0
+    gradient_clip_algorithm: norm
+    default_root_dir: ${output_dir}
+
+agent:
+  _target_: navsim.agents.recogdrive.recogdrive_agent.ReCogDriveAgent
+  _convert_: 'all'
+  trajectory_sampling:
+    _target_: nuplan.planning.simulation.trajectory.trajectory_sampling.TrajectorySampling
+    _convert_: 'all'
+    time_horizon: 4
+    interval_length: 0.5
+
+  experiment_tag: B1-DriveMem-freezeViT-projector
+  checkpoint_path: ${oc.env:STUDENT_CHECKPOINT,/path/to/student_language_planner.ckpt}
+  vlm_path: ${oc.env:STUDENT_VLM_PATH,/path/to/ReCogDrive-VLM-2B}
+  cam_type: single
+  vlm_type: internvl
+  dit_type: small
+  sampling_method: ddim
+  cache_mode: False
+  cache_hidden_state: False
+  metric_cache_path: ''
+  reference_policy_checkpoint: ''
+  vlm_size: small
+  train_backbone: true
+  grpo: False
+  lr: 1e-5
+
+  enable_teacher: false
+  use_teacher: false
+  use_sgdrive_teacher: false
+  sgdrive_teacher_config: ''
+  sgdrive_teacher_checkpoint: ''
+  sgdrive_teacher_vlm_path: ''
+  sgdrive_teacher_vlm_type: ''
+  sgdrive_teacher_feature_keys: [scene, agent, goal]
+  freeze_sgdrive_teacher: True
+  teacher_eval_mode: True
+  debug_print_teacher_shapes: False
+  teacher_feature_source: cached
+
+  use_future_queries: false
+  use_h_future: false
+  use_student_world_adapter: false
+  student_world_dim: 256
+  student_world_num_tokens: 4
+  student_world_use_mlp: True
+  student_world_use_cross_attn: False
+  student_world_num_heads: 4
+  student_world_source: cognition_tokens
+  student_world_dropout: 0.0
+
+  use_distill: false
+  use_teacher_distill: false
+  use_structural_world_distill: false
+  lambda_hidden: 0.0
+  struct_distill_loss_type: mse_plus_cosine
+  struct_distill_weight: 0.0
+  scene_distill_weight: 0.0
+  agent_distill_weight: 0.0
+  goal_distill_weight: 0.0
+  detach_teacher: True
+  normalize_distill_features: True
+
+  use_planner_modulation_from_future: false
+  use_world_tokens_as_planner_condition: false
+  world_condition_fusion_type: concat
+  world_condition_detach: False
+  world_condition_weight: 0.0
+  use_world_denoise_influence: false
+  world_denoise_influence_type: cross_attn_plus_film
+  use_world_denoise_cross_attn: false
+  use_world_denoise_film: false
+  world_denoise_dim: 256
+  world_denoise_num_heads: 4
+  world_denoise_dropout: 0.0
+  world_denoise_use_scene: True
+  world_denoise_use_agent: True
+  world_denoise_use_goal: True
+  world_denoise_pooling: mean
+  world_denoise_apply_layers: []
+  world_denoise_apply_steps: all
+  world_denoise_custom_steps: []
+  world_denoise_residual_scale: 1.0
+  world_denoise_gate_init: -2.0
+  world_denoise_detach_world_tokens: False
+  debug_world_denoise_influence: False
+
+  # Online hidden-state DriveMem training: keep LLM/planner/DriveMem trainable,
+  # but freeze backbone.model.vision_model and backbone.model.mlp1 via this train mode.
+  latentsight_train_mode: freeze_vit_projector_train_llm_planner
+  projector_type: cross_attn
+  hidden_loss_type: mse_plus_cosine
+  teacher_latent_dim: 256
+  projector_num_heads: 4
+  projector_dropout: 0.0
+  use_paramwise_optimizer: True
+  optimizer_weight_decay: 0.01
+  scheduler_epochs: 10
+  scheduler_warmup_epochs: 1
+  projector_lr: 0.0
+  future_query_lr: 0.0
+  planner_condition_lr: 0.0
+  lora_lr: 0.0
+  vlm_lr: 1e-6
+  planner_head_lr: 1e-5
+  drivemem_lr: 1e-4
+
+  drivemem:
+    enabled: true
+    use_dsu_side_branch: true
+    use_dsu_main_path: false
+    dsu_type: token
+    dsu_apply_source: hidden
+    dsu_hidden_indices: []
+    dsu_p: 0.05
+    dsu_eps: 1e-6
+    dsu_factor: 0.5
+    detach_side_branch: true
+
+    use_ifa: true
+    ifa_dim: 256
+    ifa_hidden_dim: 1024
+    ifa_pooling: mean
+    ifa_dropout: 0.0
+    loss_ifa_orth_weight: 0.01
+    loss_dsu_consistency_weight: 0.05
+
+    use_pmb: true
+    num_prototypes: 128
+    memory_dim: 256
+    top_k: 8
+    temperature: 0.07
+    normalize_query: true
+    normalize_memory: true
+    memory_init: random
+    memory_weight_mode: soft
+    typical_critical_gamma: 0.8
+    loss_memory_recon_weight: 0.1
+    loss_memory_refine_weight: 0.0
+    loss_memory_entropy_weight: 0.0
+    loss_memory_diversity_weight: 0.0
+
+    use_memory_fusion: true
+    fusion_type: residual
+    memory_gate_init_bias: -2.0
+    lambda_mem_init: 0.1
+    train_lambda_mem: true
+
+    train_visual_backbone: false
+    train_ifa: true

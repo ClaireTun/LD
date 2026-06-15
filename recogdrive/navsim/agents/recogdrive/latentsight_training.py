@@ -392,7 +392,8 @@ def set_v2_finetune_mode(model: nn.Module, mode: str, cfg: Optional[Any] = None)
     future_query_keywords = ("student_world_adapter",)
     distill_projector_keywords = ("structural_world_distill_loss", "teacher_to_token_projector")
     planner_condition_keywords = ("world_condition_projector", "world_condition_gate", "world_denoise_modulator")
-    new_module_keywords = future_query_keywords + distill_projector_keywords + planner_condition_keywords
+    drivemem_keywords = ("drivemem",)
+    new_module_keywords = future_query_keywords + distill_projector_keywords + planner_condition_keywords + drivemem_keywords
     planner_keywords = ("action_head",)
     vlm_keywords = ("backbone",)
 
@@ -498,6 +499,7 @@ def build_latentsight_optimizer_groups(model: nn.Module, base_lr: float, weight_
         ("llm", ("backbone.model.language_model",), getattr(model, "llm_lr", getattr(model, "vlm_lr", 5e-6))),
         ("vlm", ("backbone",), getattr(model, "vlm_lr", 5e-6)),
         ("planner_head", ("action_head",), getattr(model, "planner_head_lr", 5e-5)),
+        ("drivemem", ("drivemem",), getattr(model, "drivemem_lr", 1e-4)),
     ]
     used = set()
     groups = []
