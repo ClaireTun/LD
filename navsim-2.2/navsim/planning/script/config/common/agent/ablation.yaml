@@ -1,0 +1,29 @@
+# Ablation snippets for world denoise influence
+# A0_baseline
+# use_sgdrive_teacher: False
+# use_student_world_adapter: False
+# use_world_denoise_influence: False
+
+# A1_struct_distill_only
+# use_sgdrive_teacher: True
+# use_student_world_adapter: True
+# use_structural_world_distill: True
+# use_world_denoise_influence: False
+
+# A2_cross_attn_influence
+# use_world_denoise_influence: True
+# world_denoise_influence_type: "cross_attn"
+# use_world_denoise_cross_attn: True
+# use_world_denoise_film: False
+
+# A3_film_influence
+# use_world_denoise_influence: True
+# world_denoise_influence_type: "film"
+# use_world_denoise_cross_attn: False
+# use_world_denoise_film: True
+
+# A4_cross_attn_plus_film
+# use_world_denoise_influence: True
+# world_denoise_influence_type: "cross_attn_plus_film"
+# use_world_denoise_cross_attn: True
+# use_world_denoise_film: True
