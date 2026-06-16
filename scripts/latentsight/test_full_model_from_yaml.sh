@@ -19,16 +19,22 @@ export NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-0}
 export NCCL_SHM_DISABLE=${NCCL_SHM_DISABLE:-0}
 export CUDA_LAUNCH_BLOCKING=${CUDA_LAUNCH_BLOCKING:-1}
 
-# Select one of B1/B2/B3/B4, or pass YAML_CONFIG directly for a custom YAML.
+# Select one of B1/B2/B3/B3_DREAM/B3_FULL/B4/B5, or pass YAML_CONFIG directly for a custom YAML.
+
 EXPERIMENT=${EXPERIMENT:-B1}
 if [[ -z "${YAML_CONFIG:-}" ]]; then
   case "${EXPERIMENT}" in
     B1) YAML_CONFIG=${REPO_ROOT}/configs/latentsight/v2/b1_student_low_lr_full_finetune.yaml ;;
     B2) YAML_CONFIG=${REPO_ROOT}/configs/latentsight/v2/b2_query_carrier_low_lr_full_finetune.yaml ;;
     B3) YAML_CONFIG=${REPO_ROOT}/configs/latentsight/v2/b3_teacher_future_distill_single_condition.yaml ;;
-    B4) YAML_CONFIG=${REPO_ROOT}/configs/latentsight/v2/b4_teacher_distill_deep_modulation.yaml ;;
+    #B4) YAML_CONFIG=${REPO_ROOT}/configs/latentsight/v2/b4_teacher_distill_deep_modulation.yaml ;;
+    B3_DREAM) YAML_CONFIG=${REPO_ROOT}/configs/latentsight/b3_freeze_vit_dream_distill.yaml ;;
+    B3_FULL) YAML_CONFIG=${REPO_ROOT}/configs/latentsight/b3_freeze_vit_full_distill.yaml ;;
+    B4) YAML_CONFIG=${REPO_ROOT}/configs/latentsight/b4_freeze_vit_deep_modulation.yaml ;;
+    B5) YAML_CONFIG=${REPO_ROOT}/configs/latentsight/b5_freeze_vit_three_stage_distill.yaml ;;
     *)
-      echo "[LatentSight][Eval][ERROR] Unsupported EXPERIMENT=${EXPERIMENT}. Use B1/B2/B3/B4 or set YAML_CONFIG=/path/to/config.yaml." >&2
+      #echo "[LatentSight][Eval][ERROR] Unsupported EXPERIMENT=${EXPERIMENT}. Use B1/B2/B3/B4 or set YAML_CONFIG=/path/to/config.yaml." >&2
+      echo "[LatentSight][Eval][ERROR] Unsupported EXPERIMENT=${EXPERIMENT}. Use B1/B2/B3/B3_DREAM/B3_FULL/B4/B5 or set YAML_CONFIG=/path/to/config.yaml." >&2
       exit 2
       ;;
   esac
@@ -91,6 +97,8 @@ keys = [
     "sgdrive_teacher_vlm_path",
     "sgdrive_teacher_vlm_type",
     "sgdrive_teacher_feature_keys",
+    "student_world_keys",
+    "struct_distill_keys",
     "freeze_sgdrive_teacher",
     "teacher_eval_mode",
     "debug_print_teacher_shapes",
@@ -109,6 +117,8 @@ keys = [
     "scene_distill_weight",
     "agent_distill_weight",
     "goal_distill_weight",
+    "dream_agent_distill_weight",
+    "dream_scene_distill_weight",
     "detach_teacher",
     "normalize_distill_features",
     "use_world_tokens_as_planner_condition",

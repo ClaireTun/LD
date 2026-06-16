@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -10,9 +10,10 @@ import torch.nn.functional as F
 class StudentWorldAdapter(nn.Module):
     """Produces trainable student hidden future/world tokens from VLM cognition tokens.
 
-    Expected input: [B, N, C]. Output scene/agent/goal tensors: [B, K, D].
-    With ``student_world_use_cross_attn=True`` learned future queries cross-attend
-    to cognition tokens, so H_future is directly conditioned on the VLM hidden state.
+    Expected input: [B, N, C]. Output tensors are keyed by ``student_world_keys``
+    (default: scene/agent/goal), each with shape [B, K, D].  With
+    ``student_world_use_cross_attn=True`` learned future queries cross-attend to
+    cognition tokens, so H_future is directly conditioned on the VLM hidden state.
     """
 
     def __init__(
@@ -24,11 +25,13 @@ class StudentWorldAdapter(nn.Module):
         student_world_dropout: float = 0.0,
         student_world_use_cross_attn: bool = False,
         student_world_num_heads: int = 4,
+        student_world_keys: Optional[Iterable[str]] = None,
     ):
         super().__init__()
         self.student_world_num_tokens = student_world_num_tokens
         self.student_world_dim = student_world_dim
         self.student_world_use_cross_attn = student_world_use_cross_attn
+        self.student_world_keys = list(student_world_keys or ["scene", "agent", "goal"])
         self.input_proj = nn.Linear(input_dim, student_world_dim)
         self.input_norm = nn.LayerNorm(student_world_dim)
         self.core = nn.Sequential(
@@ -54,9 +57,12 @@ class StudentWorldAdapter(nn.Module):
             )
         else:
             out_dim = student_world_dim * student_world_num_tokens
-            self.scene_head = nn.Linear(student_world_dim, out_dim)
-            self.agent_head = nn.Linear(student_world_dim, out_dim)
-            self.goal_head = nn.Linear(student_world_dim, out_dim)
+            # self.scene_head = nn.Linear(student_world_dim, out_dim)
+            # self.agent_head = nn.Linear(student_world_dim, out_dim)
+            # self.goal_head = nn.Linear(student_world_dim, out_dim)
+            self.key_heads = nn.ModuleDict({
+                key: nn.Linear(student_world_dim, out_dim) for key in self.student_world_keys
+            })
         self.output_norm = nn.LayerNorm(student_world_dim)
 
     def forward(self, cognition_tokens: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -65,7 +71,8 @@ class StudentWorldAdapter(nn.Module):
             q = self.future_queries.unsqueeze(0).expand(x.shape[0], -1, -1).to(dtype=x.dtype, device=x.device)
             h, _ = self.future_attn(q, x, x, need_weights=False)
             h = self.output_norm(h + self.future_ffn(h))
-            return {"scene": h, "agent": h, "goal": h}
+            #return {"scene": h, "agent": h, "goal": h}
+            return {key: h for key in self.student_world_keys}
 
         pooled = x.mean(dim=1)
 
@@ -73,8 +80,8 @@ class StudentWorldAdapter(nn.Module):
             y = head(pooled)
             return self.output_norm(y.view(y.shape[0], self.student_world_num_tokens, -1))
 
-        return {"scene": _reshape(self.scene_head), "agent": _reshape(self.agent_head), "goal": _reshape(self.goal_head)}
-
+        #return {"scene": _reshape(self.scene_head), "agent": _reshape(self.agent_head), "goal": _reshape(self.goal_head)}
+        return {key: _reshape(head) for key, head in self.key_heads.items()}
 
 class TeacherToTokenProjector(nn.Module):
     """Project SGDrive teacher latent [B, Nt, Dt] into K student tokens [B, K, Ds]."""
@@ -196,6 +203,9 @@ class StructuralWorldDistillLoss(nn.Module):
         scene_distill_weight: float = 1.0,
         agent_distill_weight: float = 1.0,
         goal_distill_weight: float = 1.0,
+        dream_scene_distill_weight: float = 1.0,
+        dream_agent_distill_weight: float = 1.0,
+        struct_distill_keys: Optional[Iterable[str]] = None,
         detach_teacher: bool = True,
         normalize_distill_features: bool = True,
         student_world_num_tokens: int = 1,
@@ -205,7 +215,15 @@ class StructuralWorldDistillLoss(nn.Module):
         projector_dropout: float = 0.0,
     ):
         super().__init__()
-        self.key_w = {"scene": scene_distill_weight, "agent": agent_distill_weight, "goal": goal_distill_weight}
+        #self.key_w = {"scene": scene_distill_weight, "agent": agent_distill_weight, "goal": goal_distill_weight}
+        self.distill_keys: List[str] = list(struct_distill_keys or ["scene", "agent", "goal"])
+        self.key_w = {
+            "scene": scene_distill_weight,
+            "agent": agent_distill_weight,
+            "goal": goal_distill_weight,
+            "dream_scene": dream_scene_distill_weight,
+            "dream_agent": dream_agent_distill_weight,
+        }
         self.detach_teacher = detach_teacher
         self.student_world_dim = student_world_dim
         self.teacher_to_token_projector = nn.ModuleDict({
@@ -217,7 +235,8 @@ class StructuralWorldDistillLoss(nn.Module):
                 num_heads=projector_num_heads,
                 dropout=projector_dropout,
             )
-            for key in ["scene", "agent", "goal"]
+            #for key in ["scene", "agent", "goal"]
+            for key in self.distill_keys
         })
         self.hidden_loss = HiddenDistillationLoss(
             loss_type=struct_distill_loss_type,
@@ -230,9 +249,10 @@ class StructuralWorldDistillLoss(nn.Module):
         device = first_student.device if first_student is not None else torch.device("cpu")
         zero = torch.tensor(0.0, device=device)
         logs: Dict[str, torch.Tensor] = {
-            "loss_struct_scene": zero,
-            "loss_struct_agent": zero,
-            "loss_struct_goal": zero,
+            # "loss_struct_scene": zero,
+            # "loss_struct_agent": zero,
+            # "loss_struct_goal": zero,
+            **{f"loss_struct_{key}": zero for key in self.distill_keys},
             "loss_struct_total": zero,
             "loss_hidden": zero,
             "loss_hidden_mse": zero,
@@ -244,7 +264,8 @@ class StructuralWorldDistillLoss(nn.Module):
         }
         total = zero
         count = 0
-        for key in ["scene", "agent", "goal"]:
+        #for key in ["scene", "agent", "goal"]:
+        for key in self.distill_keys:
             t = teacher_outputs.get(key, None)
             s = student_world.get(key, None)
             if t is None or s is None:
@@ -255,7 +276,7 @@ class StructuralWorldDistillLoss(nn.Module):
                 t = t.unsqueeze(1)
             z = self.teacher_to_token_projector[key](t.to(dtype=s.dtype, device=s.device))
             lk, lk_logs = self.hidden_loss(s, z)
-            lk = lk * self.key_w[key]
+            lk = lk * self.key_w.get(key, 1.0)
             logs[f"loss_struct_{key}"] = lk.detach()
             total = total + lk
             count += 1

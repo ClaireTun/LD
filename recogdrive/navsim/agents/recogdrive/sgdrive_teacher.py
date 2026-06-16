@@ -16,7 +16,8 @@ class FrozenSGDriveTeacher(torch.nn.Module):
         "scene": Tensor | None,
         "agent": Tensor | None,
         "goal": Tensor | None,
-        "world": Tensor | None,
+        "dream_scene": Tensor | None,
+        "dream_agent": Tensor | None,
     }
     """
 
@@ -24,7 +25,8 @@ class FrozenSGDriveTeacher(torch.nn.Module):
         "scene": ["occ_hidden_state", "occ_out", "scene_hidden_state", "scene"],
         "agent": ["agent_hidden_state", "agent_out", "agent"],
         "goal": ["gp_hidden_state", "gp_out", "goal_hidden_state", "goal"],
-        "world": ["dream_occ_hidden_state", "dream_occ_out", "dream_agent_hidden_state", "dream_agent_out", "world"],
+        "dream_scene": ["dream_occ_hidden_state", "dream_occ_out", "dream_scene_hidden_state", "dream_scene"],
+        "dream_agent": ["dream_agent_hidden_state", "dream_agent_out", "dream_agent"],
     }
 
     def __init__(
@@ -265,7 +267,14 @@ class FrozenSGDriveTeacher(torch.nn.Module):
         tokens_list: Optional[Any] = None,
         teacher_feature_source: str = "cached",
     ) -> Dict[str, Optional[torch.Tensor]]:
-        outputs: Dict[str, Optional[torch.Tensor]] = {"scene": None, "agent": None, "goal": None, "world": None}
+        #outputs: Dict[str, Optional[torch.Tensor]] = {"scene": None, "agent": None, "goal": None, "world": None}
+        outputs: Dict[str, Optional[torch.Tensor]] = {
+            "scene": None,
+            "agent": None,
+            "goal": None,
+            "dream_scene": None,
+            "dream_agent": None,
+        }
 
         self.teacher_feature_source = teacher_feature_source
         teacher_prediction = None
@@ -283,7 +292,8 @@ class FrozenSGDriveTeacher(torch.nn.Module):
             self._warn_once("feature_source", f"unknown teacher_feature_source={teacher_feature_source}, fallback to cached")
 
         for key in outputs.keys():
-            if key not in self.feature_keys and key != "world":
+            #if key not in self.feature_keys and key != "world":
+            if key not in self.feature_keys:
                 continue
             tensor = None
             if teacher_feature_source == "online":

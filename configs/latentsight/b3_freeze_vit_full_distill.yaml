@@ -14,7 +14,7 @@ defaults:
   - default_train_val_test_log_split
   - _self_
 
-experiment_name: latentsight_v4_b3_freeze_vit_projector
+experiment_name: latentsight_v4_b3_freeze_vit_full_distill
 split: trainval
 cache_path: ""
 use_cache_without_dataset: false
@@ -70,7 +70,7 @@ agent:
     time_horizon: 4
     interval_length: 0.5
 
-  experiment_tag: B3-freezeViT-vit2llm-projector
+  experiment_tag: B3-freezeViT-full-5key-distill
   checkpoint_path: ${oc.env:STUDENT_CHECKPOINT,/path/to/student_language_planner.ckpt}
   vlm_path: ${oc.env:STUDENT_VLM_PATH,/path/to/ReCogDrive-VLM-2B}
   cam_type: single
@@ -93,9 +93,10 @@ agent:
   sgdrive_teacher_checkpoint: ${oc.env:SGDRIVE_TEACHER_CHECKPOINT,/path/to/sgdrive_teacher.ckpt}
   sgdrive_teacher_vlm_path: ${oc.env:SGDRIVE_TEACHER_VLM_PATH,/path/to/SGDrive-VLM}
   sgdrive_teacher_vlm_type: ${oc.env:SGDRIVE_TEACHER_VLM_TYPE,internvl_wm}
-  sgdrive_teacher_feature_keys: [scene, agent, goal]
-  struct_distill_keys: [scene, agent, goal]
-  student_world_keys: [scene, agent, goal]
+  sgdrive_teacher_feature_keys: [scene, agent, goal, dream_scene, dream_agent]
+  # Full distillation uses scene/agent/goal plus SGDrive dream-world latent tokens.
+  struct_distill_keys: [scene, agent, goal, dream_scene, dream_agent]
+  student_world_keys: [scene, agent, goal, dream_scene, dream_agent]
   freeze_sgdrive_teacher: True
   teacher_eval_mode: True
   debug_print_teacher_shapes: False

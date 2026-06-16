@@ -24,6 +24,8 @@ use_sgdrive_teacher: False
 sgdrive_teacher_config: ""
 sgdrive_teacher_checkpoint: ""
 sgdrive_teacher_feature_keys: ["scene", "agent", "goal"]
+struct_distill_keys: ["scene", "agent", "goal"]
+student_world_keys: ["scene", "agent", "goal"]
 freeze_sgdrive_teacher: True
 teacher_eval_mode: True
 debug_print_teacher_shapes: False
@@ -41,6 +43,8 @@ struct_distill_weight: 1.0
 scene_distill_weight: 1.0
 agent_distill_weight: 1.0
 goal_distill_weight: 1.0
+dream_scene_distill_weight: 1.0
+dream_agent_distill_weight: 1.0
 detach_teacher: True
 normalize_distill_features: True
 
