@@ -550,11 +550,20 @@ class ReCogDriveAgent(AbstractAgent):
             student_world = self.student_world_adapter(last_hidden_state)
             #planner_world_tokens = torch.cat([student_world["scene"], student_world["agent"], student_world["goal"]], dim=1)
             planner_token_list = [
-                tensor for key, tensor in student_world.items() if key in self.student_world_keys
+                #tensor for key, tensor in student_world.items() if key in self.student_world_keys
+                student_world[key] for key in self.student_world_keys if key in student_world
             ]
             if not planner_token_list:
                 raise ValueError(f"StudentWorldAdapter produced no tokens for student_world_keys={self.student_world_keys}")
-            planner_world_tokens = torch.cat(planner_token_list, dim=1)
+            #planner_world_tokens = torch.cat(planner_token_list, dim=1)
+            if getattr(self.student_world_adapter, "student_world_use_cross_attn", False):
+                # Cross-attention mode currently returns the same shared H_future
+                # tensor for every student_world_key.  Keep that shared
+                # future-query representation for distillation, but avoid
+                # repeating identical tokens as planner condition.
+                planner_world_tokens = planner_token_list[0]
+            else:
+                planner_world_tokens = torch.cat(planner_token_list, dim=1)
             
             if self.world_condition_detach:
                 planner_world_tokens = planner_world_tokens.detach()

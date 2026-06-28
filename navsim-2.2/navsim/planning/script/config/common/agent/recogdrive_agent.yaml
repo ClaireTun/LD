@@ -9,6 +9,7 @@ trajectory_sampling:
 checkpoint_path: ''
 vlm_path: ''
 cam_type: 'single'
+load_lidar: False
 vlm_type: 'internvl'
 dit_type: 'small'
 sampling_method: 'ddim'
@@ -73,3 +74,32 @@ world_denoise_residual_scale: 1.0
 world_denoise_gate_init: -2.0
 world_denoise_detach_world_tokens: False
 debug_world_denoise_influence: False
+
+# Checkpoint compatibility for legacy ReCogDrive / student / DriveMem checkpoints.
+checkpoint_state_key: "state_dict"
+auto_configure_from_checkpoint: True
+strict_checkpoint_loading: False
+
+# DriveMem is off for the baseline model, but auto_configure_from_checkpoint
+# enables and sizes it when a DriveMem checkpoint contains drivemem.* tensors.
+drivemem:
+  enabled: False
+  use_dsu_side_branch: True
+  use_dsu_main_path: False
+  dsu_type: "token"
+  detach_side_branch: True
+  use_ifa: True
+  use_pmb: True
+  use_memory_fusion: True
+  memory_dim: 256
+  ifa_dim: 256
+  ifa_pooling: "mean"
+  num_prototypes: 128
+  top_k: 8
+  temperature: 0.07
+  normalize_query: True
+  normalize_memory: True
+  memory_weight_mode: "soft"
+  memory_gate_init_bias: -2.0
+  lambda_mem_init: 0.1
+  train_lambda_mem: True

@@ -43,9 +43,12 @@ class ReCogDriveFeatureBuilder(AbstractFeatureBuilder):
         self.backbone = None
         self.cache_mode = cache_mode
 
-        if self.cache_hidden_state and self.cache_mode:
+        #if self.cache_hidden_state and self.cache_mode:
+        if self.cache_hidden_state:
             if not model_type or not checkpoint_path:
-                raise ValueError("In online mode (cache_hidden_state=True), `model_type` and `checkpoint_path` must be provided.")
+                #raise ValueError("In online mode (cache_hidden_state=True), `model_type` and `checkpoint_path` must be provided.")
+                raise ValueError("In online hidden-state mode (cache_hidden_state=True), `model_type` and `checkpoint_path` must be provided.")
+                pass
             self.backbone = RecogDriveBackbone(
                 model_type=model_type,
                 checkpoint_path=checkpoint_path,
@@ -72,7 +75,8 @@ class ReCogDriveFeatureBuilder(AbstractFeatureBuilder):
         ], dim=-1)
 
 
-        if not self.cache_hidden_state:
+        #if not self.cache_hidden_state:
+        if not self.cache_hidden_state or self.backbone is None:
             # image_path = str(cameras[-1].cam_f0.image)
             
             # path_as_ordinals = [ord(char) for char in image_path]
@@ -113,8 +117,8 @@ class ReCogDriveFeatureBuilder(AbstractFeatureBuilder):
                 "pixel_values": pixel_values.float().cpu(),
             }
         else:
-            if self.backbone is None:
-                raise RuntimeError("FeatureBuilder is in online mode, but the backbone was not initialized.")
+            # if self.backbone is None:
+            #     raise RuntimeError("FeatureBuilder is in online mode, but the backbone was not initialized.")
             
             pixel_values = load_image(str(cameras[-1].cam_f0.image),max_num=12).unsqueeze(0)
 

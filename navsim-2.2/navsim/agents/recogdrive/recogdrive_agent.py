@@ -41,10 +41,12 @@ from .drivemem import DriveMemModule
 class ReCogDriveAgent(AbstractAgent):
     def __init__(
         self,
-        trajectory_sampling: TrajectorySampling,
+        #trajectory_sampling: TrajectorySampling,
+        trajectory_sampling: Optional[TrajectorySampling] = None,
         vlm_path: Optional[str] = None,
         checkpoint_path: Optional[str] = None,
         cam_type: Optional[str] = 'single', 
+        load_lidar: bool = False,
         vlm_type: Optional[str] = 'internvl', 
         dit_type: Optional[str] = 'small', 
         sampling_method: Optional[str] = 'ddim', 
@@ -157,6 +159,15 @@ class ReCogDriveAgent(AbstractAgent):
         lora_alpha: int = 16,
         lora_dropout: float = 0.05,
         lora_target_modules: Optional[List[str]] = None,
+
+        checkpoint_state_key: str = "state_dict",
+        auto_configure_from_checkpoint: bool = True,
+        strict_checkpoint_loading: bool = False,
+
+        progress_weight: Optional[float] = None,
+        ttc_weight: Optional[float] = None,
+        comfortable_weight: Optional[float] = None,
+        **legacy_agent_kwargs: Any,
     ):
         
         if enable_teacher is not None:
@@ -181,11 +192,20 @@ class ReCogDriveAgent(AbstractAgent):
             use_world_tokens_as_planner_condition = bool(use_planner_modulation_from_future) and bool(use_world_tokens_as_planner_condition)
             use_world_denoise_influence = bool(use_planner_modulation_from_future) and bool(use_world_denoise_influence)
         
-        super().__init__()
+        #super().__init__()
 
-        self._trajectory_sampling = trajectory_sampling
+        trajectory_sampling = trajectory_sampling or TrajectorySampling(time_horizon=4, interval_length=0.5)
+        super().__init__(trajectory_sampling=trajectory_sampling)
         self.vlm_path = vlm_path
+        self.cam_type = cam_type
+        self.load_lidar = bool(load_lidar)
         self.checkpoint_path = checkpoint_path
+        self.checkpoint_state_key = checkpoint_state_key
+        self.auto_configure_from_checkpoint = auto_configure_from_checkpoint
+        self.strict_checkpoint_loading = strict_checkpoint_loading
+        self.legacy_agent_kwargs = dict(legacy_agent_kwargs)
+        if self.legacy_agent_kwargs:
+            print(f"[ReCogDriveAgent] Ignoring legacy agent config keys: {sorted(self.legacy_agent_kwargs)}")
         self.vlm_type = vlm_type
         self.dit_type = dit_type
         self.cache_mode = cache_mode
@@ -231,6 +251,31 @@ class ReCogDriveAgent(AbstractAgent):
         self.drivemem_cfg = OmegaConf.to_container(drivemem, resolve=True) if isinstance(drivemem, DictConfig) else (dict(drivemem) if isinstance(drivemem, dict) else {})
         self.drivemem: Optional[DriveMemModule] = None
         #self.use_paramwise_optimizer = use_paramwise_optimizer or self.latentsight_train_mode in ["projector_only", "vlm_lora", "low_lr_full_finetune"]
+        
+        checkpoint_state_dict: Optional[Dict[str, torch.Tensor]] = None
+        if self.checkpoint_path and self.auto_configure_from_checkpoint:
+            checkpoint_state_dict = self._load_trusted_checkpoint(self.checkpoint_path, state_key=self.checkpoint_state_key)
+            (
+                use_student_world_adapter,
+                use_world_tokens_as_planner_condition,
+                student_world_dim,
+                student_world_num_tokens,
+                student_world_keys,
+                student_world_use_cross_attn,
+                self.drivemem_cfg,
+            ) = self._auto_configure_optional_modules_from_checkpoint(
+                checkpoint_state_dict,
+                use_student_world_adapter=use_student_world_adapter,
+                use_world_tokens_as_planner_condition=use_world_tokens_as_planner_condition,
+                student_world_dim=student_world_dim,
+                student_world_num_tokens=student_world_num_tokens,
+                student_world_keys=student_world_keys,
+                student_world_use_cross_attn=student_world_use_cross_attn,
+                drivemem_cfg=self.drivemem_cfg,
+            )
+            self.use_student_world_adapter = use_student_world_adapter
+            self.student_world_keys = list(student_world_keys or self.student_world_keys)
+            self.use_world_tokens_as_planner_condition = use_world_tokens_as_planner_condition
         
         self.optimizer_weight_decay = optimizer_weight_decay
         self.scheduler_epochs = scheduler_epochs
@@ -292,7 +337,9 @@ class ReCogDriveAgent(AbstractAgent):
         device = f"cuda:{local_rank}"
         self.device = device
         if not self.cache_hidden_state and not self.cache_mode:
-            print("Agent running in 'no-cache' mode. Initializing internal backbone.")
+        #     print("Agent running in 'no-cache' mode. Initializing internal backbone.")
+
+            print("Agent running with image inputs. Initializing internal backbone.")
             if not self.vlm_path or not self.vlm_type:
                 raise ValueError("In 'no-cache' mode, vlm_path and vlm_type are required.")
             self.backbone = RecogDriveBackbone(
@@ -334,6 +381,14 @@ class ReCogDriveAgent(AbstractAgent):
         cfg.world_denoise_gate_init = world_denoise_gate_init
         cfg.world_denoise_detach_world_tokens = world_denoise_detach_world_tokens
         cfg.debug_world_denoise_influence = debug_world_denoise_influence
+
+        if progress_weight is not None:
+            cfg.grpo_cfg.scorer_config.progress_weight = float(progress_weight)
+        if ttc_weight is not None:
+            cfg.grpo_cfg.scorer_config.ttc_weight = float(ttc_weight)
+        if comfortable_weight is not None:
+            cfg.grpo_cfg.scorer_config.history_comfort_weight = float(comfortable_weight)
+            cfg.grpo_cfg.scorer_config.two_frame_extended_comfort_weight = float(comfortable_weight)
 
         if self.grpo:
             cfg.grpo_cfg.metric_cache_path = self.metric_cache_path
@@ -416,7 +471,15 @@ class ReCogDriveAgent(AbstractAgent):
         return self.__class__.__name__
     
     @staticmethod
-    def _load_trusted_checkpoint(checkpoint_path: str) -> Dict[str, torch.Tensor]:
+    #def _load_trusted_checkpoint(checkpoint_path: str) -> Dict[str, torch.Tensor]:
+    def _strip_checkpoint_prefix(key: str) -> str:
+        for prefix in ("agent.", "model.", "module.", "_orig_mod."):
+            if key.startswith(prefix):
+                return ReCogDriveAgent._strip_checkpoint_prefix(key[len(prefix):])
+        return key
+
+    @staticmethod
+    def _load_trusted_checkpoint(checkpoint_path: str, state_key: str = "state_dict") -> Dict[str, torch.Tensor]:
         """Load a project checkpoint saved by Lightning/torch.
 
         PyTorch 2.6 changed ``torch.load`` to default to ``weights_only=True``.
@@ -428,24 +491,130 @@ class ReCogDriveAgent(AbstractAgent):
             checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         except TypeError:
             checkpoint = torch.load(checkpoint_path, map_location="cpu")
-        if not isinstance(checkpoint, dict) or "state_dict" not in checkpoint:
-            raise KeyError(f"Checkpoint {checkpoint_path!r} does not contain a 'state_dict' entry.")
-        return checkpoint["state_dict"]
+        # if not isinstance(checkpoint, dict) or "state_dict" not in checkpoint:
+        #     raise KeyError(f"Checkpoint {checkpoint_path!r} does not contain a 'state_dict' entry.")
+        # return checkpoint["state_dict"]
+        if not isinstance(checkpoint, dict):
+            raise TypeError(f"Checkpoint {checkpoint_path!r} must be a dict-like PyTorch checkpoint.")
+        if state_key in checkpoint and isinstance(checkpoint[state_key], dict):
+            checkpoint = checkpoint[state_key]
+        elif "state_dict" in checkpoint and isinstance(checkpoint["state_dict"], dict):
+            checkpoint = checkpoint["state_dict"]
+        elif not all(isinstance(value, torch.Tensor) for value in checkpoint.values()):
+            raise KeyError(
+                f"Checkpoint {checkpoint_path!r} does not contain a tensor state dict under "
+                f"{state_key!r} or 'state_dict'."
+            )
+        return {
+            ReCogDriveAgent._strip_checkpoint_prefix(key): value
+            for key, value in checkpoint.items()
+            if isinstance(value, torch.Tensor)
+        }
+
+    @staticmethod
+    def _auto_configure_optional_modules_from_checkpoint(
+        ckpt: Dict[str, torch.Tensor],
+        *,
+        use_student_world_adapter: bool,
+        use_world_tokens_as_planner_condition: bool,
+        student_world_dim: int,
+        student_world_num_tokens: int,
+        student_world_keys: Optional[List[str]],
+        student_world_use_cross_attn: bool,
+        drivemem_cfg: Dict[str, Any],
+    ):
+        student_keys = [key for key in ckpt if key.startswith("student_world_adapter.")]
+        if student_keys:
+            use_student_world_adapter = True
+            input_proj = ckpt.get("student_world_adapter.input_proj.weight")
+            if input_proj is not None and input_proj.ndim == 2:
+                student_world_dim = int(input_proj.shape[0])
+            future_queries = ckpt.get("student_world_adapter.future_queries")
+            if future_queries is not None and future_queries.ndim == 2:
+                student_world_use_cross_attn = True
+                student_world_num_tokens = int(future_queries.shape[0])
+            inferred_keys = []
+            for key in student_keys:
+                if key.startswith("student_world_adapter.key_heads.") and key.endswith(".weight"):
+                    inferred_keys.append(key.split(".")[2])
+            if inferred_keys:
+                student_world_keys = sorted(set(inferred_keys))
+                head_weight = ckpt.get(f"student_world_adapter.key_heads.{student_world_keys[0]}.weight")
+                if head_weight is not None and head_weight.ndim == 2 and student_world_dim > 0:
+                    student_world_num_tokens = int(head_weight.shape[0] // student_world_dim)
+
+        if any(key.startswith("world_condition_projector.") or key == "world_condition_gate" for key in ckpt):
+            use_world_tokens_as_planner_condition = True
+            projector_weight = ckpt.get("world_condition_projector.weight")
+            if projector_weight is not None and projector_weight.ndim == 2:
+                student_world_dim = int(projector_weight.shape[1])
+
+        if any(key.startswith("drivemem.") for key in ckpt):
+            drivemem_cfg = dict(drivemem_cfg or {})
+            drivemem_cfg["enabled"] = True
+            prototypes = ckpt.get("drivemem.pmb.prototypes")
+            if prototypes is not None and prototypes.ndim == 2:
+                drivemem_cfg.setdefault("num_prototypes", int(prototypes.shape[0]))
+                drivemem_cfg.setdefault("memory_dim", int(prototypes.shape[1]))
+                drivemem_cfg.setdefault("ifa_dim", int(prototypes.shape[1]))
+            if any(key.startswith("drivemem.dsu.") for key in ckpt):
+                drivemem_cfg.setdefault("use_dsu_side_branch", True)
+            drivemem_cfg.setdefault("use_dsu_main_path", False)
+
+        return (
+            use_student_world_adapter,
+            use_world_tokens_as_planner_condition,
+            student_world_dim,
+            student_world_num_tokens,
+            student_world_keys,
+            student_world_use_cross_attn,
+            drivemem_cfg,
+        )
 
     def initialize(self) -> None:
         if self.checkpoint_path:
             #ckpt = torch.load(self.checkpoint_path, map_location="cpu")["state_dict"]
-            ckpt = self._load_trusted_checkpoint(self.checkpoint_path)
+            #ckpt = self._load_trusted_checkpoint(self.checkpoint_path)
+            ckpt = self._load_trusted_checkpoint(self.checkpoint_path, state_key=self.checkpoint_state_key)
+            skipped = []
             model_dict = self.state_dict()
             filtered_ckpt = {}
             for k, v in ckpt.items():
-                k2 = k[len("agent."):] if k.startswith("agent.") else k
+                #k2 = k[len("agent."):] if k.startswith("agent.") else k
+                k2 = self._strip_checkpoint_prefix(k)
                 if k2 in model_dict and v.shape == model_dict[k2].shape:
                     filtered_ckpt[k2] = v
-            self.load_state_dict(filtered_ckpt, strict=False)
+            #self.load_state_dict(filtered_ckpt, strict=False)
+            else:
+                    skipped.append(k2)
+            missing, unexpected = self.load_state_dict(filtered_ckpt, strict=False)
+            print(
+                f"[ReCogDriveAgent] Loaded {len(filtered_ckpt)}/{len(ckpt)} checkpoint tensors "
+                f"from {self.checkpoint_path}; skipped={len(skipped)} missing={len(missing)} unexpected={len(unexpected)}"
+            )
+            if self.strict_checkpoint_loading and (skipped or missing or unexpected):
+                raise RuntimeError(
+                    f"Strict checkpoint loading failed for {self.checkpoint_path}: "
+                    f"skipped={skipped[:20]}, missing={missing[:20]}, unexpected={unexpected[:20]}"
+                )
 
     def get_sensor_config(self) -> SensorConfig:
-        return SensorConfig.build_all_sensors(include=[0, 1, 2, 3])
+        #return SensorConfig.build_all_sensors(include=[0, 1, 2, 3])
+        history_frames = [0, 1, 2, 3]
+        include_all_cameras = str(self.cam_type).lower() in {"multi", "all", "all_cameras"}
+        side_camera_include = history_frames if include_all_cameras else False
+        return SensorConfig(
+            cam_f0=history_frames,
+            cam_l0=side_camera_include,
+            cam_l1=side_camera_include,
+            cam_l2=side_camera_include,
+            cam_r0=side_camera_include,
+            cam_r1=side_camera_include,
+            cam_r2=side_camera_include,
+            cam_b0=side_camera_include,
+            lidar_pc=history_frames if self.load_lidar else False,
+        )
+
 
     def get_target_builders(self) -> List[AbstractTargetBuilder]:
         return [TrajectoryTargetBuilder(trajectory_sampling=self._trajectory_sampling)]
@@ -474,11 +643,13 @@ class ReCogDriveAgent(AbstractAgent):
         if high_command_one_hot.ndim == 1:
             high_command_one_hot = high_command_one_hot.unsqueeze(0)
 
-        if self.cache_hidden_state:
+        #if self.cache_hidden_state:
+        if self.cache_hidden_state and "last_hidden_state" in features:
             last_hidden_state = features["last_hidden_state"].cuda()
         else:
             if self.backbone is None:
-                raise RuntimeError("Agent is in 'no-cache' mode, but backbone is not initialized.")
+                #raise RuntimeError("Agent is in 'no-cache' mode, but backbone is not initialized.")
+                raise RuntimeError("Agent needs image-to-hidden-state inference, but backbone is not initialized. Set agent.cache_mode=false with a valid agent.vlm_path, or provide cached last_hidden_state features.")
             
             # image_path_tensor = features["image_path_tensor"]
             # if image_path_tensor.ndim == 1:

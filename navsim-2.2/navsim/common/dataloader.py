@@ -7,7 +7,8 @@ from typing import Any, Dict, List, Tuple
 
 from tqdm import tqdm
 
-from navsim.common.dataclasses import AgentInput, Scene, SceneFilter, SensorConfig
+#from navsim.common.dataclasses import AgentInput, Scene, SceneFilter, SensorConfig
+from navsim.common.dataclasses import AgentInput, Scene, SceneFilter, SceneMetadata, SensorConfig
 from navsim.planning.metric_caching.metric_cache import MetricCache
 
 FrameList = List[Dict[str, Any]]
@@ -84,25 +85,36 @@ def filter_synthetic_scenes(
     filter_tokens = scene_filter.synthetic_scene_tokens is not None
 
     for scene_path in tqdm(synthetic_scenes_paths, desc="Loading synthetic scenes"):
-        synthetic_scene = Scene.load_from_disk(scene_path, None, None)
+        #synthetic_scene = Scene.load_from_disk(scene_path, None, None)
+        
+        # Only metadata is needed for indexing/filtering here. Avoid Scene.load_from_disk(),
+        # which builds maps, frames, cameras, and lidar placeholders for every synthetic scene.
+        with open(scene_path, "rb") as f:
+            scene_data = pickle.load(f)
+        scene_metadata = SceneMetadata(**scene_data["scene_metadata"])
 
         # if a token is requested specifically, we load it even if it is not related to the original scenes loaded
-        if filter_tokens and synthetic_scene.scene_metadata.initial_token not in scene_filter.synthetic_scene_tokens:
+        #if filter_tokens and synthetic_scene.scene_metadata.initial_token not in scene_filter.synthetic_scene_tokens:
+        if filter_tokens and scene_metadata.initial_token not in scene_filter.synthetic_scene_tokens:
             continue
 
         # filter by log names
-        log_name = synthetic_scene.scene_metadata.log_name
+        #log_name = synthetic_scene.scene_metadata.log_name
+        log_name = scene_metadata.log_name
         if filter_logs and log_name not in scene_filter.log_names:
             continue
 
         # if we don't filter for tokens explicitly, we load only the synthetic scenes required to run a second stage for the original scenes loaded
-        if (
-            not filter_tokens
-            and synthetic_scene.scene_metadata.corresponding_original_scene not in stage1_scenes_final_frames_tokens
-        ):
+        # if (
+        #     not filter_tokens
+        #     and synthetic_scene.scene_metadata.corresponding_original_scene not in stage1_scenes_final_frames_tokens
+        # ):
+        if not filter_tokens and scene_metadata.corresponding_original_scene not in stage1_scenes_final_frames_tokens:
             continue
 
-        loaded_scenes.update({synthetic_scene.scene_metadata.initial_token: [scene_path, log_name]})
+        #loaded_scenes.update({synthetic_scene.scene_metadata.initial_token: [scene_path, log_name]})
+        loaded_scenes.update({scene_metadata.initial_token: [scene_path, log_name]})
+
 
     return loaded_scenes
 
