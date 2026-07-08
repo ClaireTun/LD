@@ -161,6 +161,18 @@ class ReCogDriveAgent(AbstractAgent):
         use_counterfactual_gain: bool = False,
         use_failure_type_attribution: bool = False,
 
+        adaptive_stage_enabled: bool = False,
+        adaptive_stage1_min_epochs: int = 0,
+        adaptive_stage2_min_epochs: int = 0,
+        adaptive_stage1_patience: int = 200,
+        adaptive_stage2_patience: int = 200,
+        adaptive_stage1_delta: float = 1e-4,
+        adaptive_stage1_ema_decay: float = 0.95,
+        adaptive_stage2_ema_decay: float = 0.95,
+        adaptive_stage2_gate_threshold: float = 0.35,
+        adaptive_stage2_intervention_threshold: float = 0.20,
+        adaptive_teacher_anneal_epochs: int = 20,
+
         experiment_tag: str = "",
         lora_r: int = 8,
         lora_alpha: int = 16,
@@ -305,6 +317,17 @@ class ReCogDriveAgent(AbstractAgent):
                     "use_self_consistency": use_self_consistency,
                     "use_counterfactual_gain": use_counterfactual_gain,
                     "use_failure_type_attribution": use_failure_type_attribution,
+                    "adaptive_stage_enabled": adaptive_stage_enabled,
+                    "adaptive_stage1_min_epochs": adaptive_stage1_min_epochs,
+                    "adaptive_stage2_min_epochs": adaptive_stage2_min_epochs,
+                    "adaptive_stage1_patience": adaptive_stage1_patience,
+                    "adaptive_stage2_patience": adaptive_stage2_patience,
+                    "adaptive_stage1_delta": adaptive_stage1_delta,
+                    "adaptive_stage1_ema_decay": adaptive_stage1_ema_decay,
+                    "adaptive_stage2_ema_decay": adaptive_stage2_ema_decay,
+                    "adaptive_stage2_gate_threshold": adaptive_stage2_gate_threshold,
+                    "adaptive_stage2_intervention_threshold": adaptive_stage2_intervention_threshold,
+                    "adaptive_teacher_anneal_epochs": adaptive_teacher_anneal_epochs,
                 }
             )
 
@@ -783,6 +806,9 @@ class ReCogDriveAgent(AbstractAgent):
                     teacher_requires_grad_count = sum(
                         1 for p in self.sgdrive_teacher.parameters() if p.requires_grad
                     ) if self.sgdrive_teacher is not None else 0
+                    
+                    dream_teacher_gate = self.latest_loss_logs.get("dream_teacher_useful_ratio", None) if self.use_dream_condition_swap_distill else None
+                    
                     distill_losses, distill_logs = self.three_stage_distiller(
                         h_future=self.last_h_future,
                         z_teacher=self.last_z_teacher,
@@ -795,6 +821,7 @@ class ReCogDriveAgent(AbstractAgent):
                         iteration=int(getattr(self, "current_distill_iter", 0)),
                         teacher_enabled=self.use_sgdrive_teacher,
                         teacher_requires_grad_count=teacher_requires_grad_count,
+                        teacher_gate=dream_teacher_gate,
                     )
                     loss_three_stage = (
                         distill_losses["loss_hidden"]
