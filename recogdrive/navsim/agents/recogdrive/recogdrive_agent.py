@@ -24,7 +24,8 @@ from .recogdrive_diffusion_planner import (
 )
 
 from .sgdrive_teacher import FrozenSGDriveTeacher
-from .world_distill import StudentWorldAdapter, StructuralWorldDistillLoss
+#from .world_distill import StudentWorldAdapter, StructuralWorldDistillLoss
+from .world_distill import StudentWorldAdapter, StructuralWorldDistillLoss, DreamConditionSwapDistillLoss
 import ast
 import numpy as np
 from .utils.internvl_preprocess import load_image, build_transform, dynamic_preprocess
@@ -75,6 +76,14 @@ class ReCogDriveAgent(AbstractAgent):
         student_world_source: str = "cognition_tokens",
         student_world_dropout: float = 0.0,
         use_structural_world_distill: bool = False,
+        use_dream_condition_swap_distill: bool = False,
+        dream_condition_distill_keys: Optional[List[str]] = None,
+        dream_condition_teacher_weight: float = 1.0,
+        dream_condition_self_weight: float = 0.25,
+        dream_condition_teacher_anneal_iters: int = 0,
+        dream_condition_teacher_min_weight: float = 0.0,
+        dream_condition_utility_margin: float = 0.0,
+        dream_condition_ema_decay: float = 0.99,
         struct_distill_loss_type: str = "cosine",
         struct_distill_weight: float = 1.0,
         scene_distill_weight: float = 1.0,
@@ -206,6 +215,17 @@ class ReCogDriveAgent(AbstractAgent):
         self.use_student_world_adapter = use_student_world_adapter
         self.student_world_source = student_world_source
         self.use_structural_world_distill = use_structural_world_distill
+        
+        self.use_dream_condition_swap_distill = bool(use_dream_condition_swap_distill)
+        self.dream_condition_distill_keys = list(dream_condition_distill_keys or ["dream_scene", "dream_agent"])
+        if self.use_dream_condition_swap_distill:
+            # B5 is dream-only: request only teacher dream features and student dream tokens.
+            self.struct_distill_keys = self.dream_condition_distill_keys
+            self.student_world_keys = self.dream_condition_distill_keys
+            self.sgdrive_teacher_feature_keys = self.dream_condition_distill_keys
+        
+        self.dream_condition_swap_distill_loss: Optional[DreamConditionSwapDistillLoss] = None
+        
         self.latest_loss_logs: Dict[str, torch.Tensor] = {}
         self.student_world_adapter: Optional[StudentWorldAdapter] = None
         self.structural_world_distill_loss: Optional[StructuralWorldDistillLoss] = None
@@ -379,6 +399,27 @@ class ReCogDriveAgent(AbstractAgent):
                 self.world_condition_gate = torch.nn.Parameter(torch.tensor(1.0, device=self.action_head.feature_encoder.weight.device))
             elif world_condition_fusion_type not in ["concat", "gated_add", "cross_attn"]:
                 raise ValueError(f"Unsupported world_condition_fusion_type: {world_condition_fusion_type}")
+        
+        if self.use_dream_condition_swap_distill:
+            self.dream_condition_swap_distill_loss = DreamConditionSwapDistillLoss(
+                student_world_dim=student_world_dim,
+                dream_distill_keys=self.dream_condition_distill_keys,
+                loss_type=self.hidden_loss_type,
+                teacher_weight=dream_condition_teacher_weight,
+                self_weight=dream_condition_self_weight,
+                teacher_anneal_iters=dream_condition_teacher_anneal_iters,
+                teacher_min_weight=dream_condition_teacher_min_weight,
+                utility_margin=dream_condition_utility_margin,
+                ema_decay=dream_condition_ema_decay,
+                detach_teacher=detach_teacher,
+                normalize=normalize_distill_features,
+                student_world_num_tokens=student_world_num_tokens,
+                projector_type=projector_type,
+                teacher_latent_dim=teacher_latent_dim,
+                projector_num_heads=projector_num_heads,
+                projector_dropout=projector_dropout,
+            ).cuda()
+        
         if self.use_structural_world_distill:
             self.structural_world_distill_loss = StructuralWorldDistillLoss(
                 student_world_dim=student_world_dim,
@@ -647,7 +688,8 @@ class ReCogDriveAgent(AbstractAgent):
                 "trainable_param_ratio": torch.tensor(self.trainable_param_ratio, device=outputs.loss.device),
                 "world_tokens_used_by_planner": torch.tensor(1.0 if self.use_world_tokens_as_planner_condition else 0.0, device=outputs.loss.device),
                 "teacher_enabled": torch.tensor(1.0 if self.use_sgdrive_teacher else 0.0, device=outputs.loss.device),
-                "distill_enabled": torch.tensor(1.0 if self.use_structural_world_distill else 0.0, device=outputs.loss.device),
+                #"distill_enabled": torch.tensor(1.0 if self.use_structural_world_distill else 0.0, device=outputs.loss.device),
+                "distill_enabled": torch.tensor(1.0 if (self.use_structural_world_distill or self.use_dream_condition_swap_distill) else 0.0, device=outputs.loss.device),
             }
             
             if drivemem_losses:
@@ -668,7 +710,28 @@ class ReCogDriveAgent(AbstractAgent):
             else:
                 self.last_h_future = None
 
-            if self.use_structural_world_distill and self.use_sgdrive_teacher and self.sgdrive_teacher is not None and self.student_world_adapter is not None and self.structural_world_distill_loss is not None:
+            #if self.use_structural_world_distill and self.use_sgdrive_teacher and self.sgdrive_teacher is not None and self.student_world_adapter is not None and self.structural_world_distill_loss is not None:
+            if self.use_dream_condition_swap_distill and self.use_sgdrive_teacher and self.sgdrive_teacher is not None and self.student_world_adapter is not None and self.dream_condition_swap_distill_loss is not None:
+                teacher_outputs_for_loss = {
+                    key: features.get(f"teacher_{key}", None) for key in self.dream_condition_distill_keys
+                }
+                student_world_for_loss = student_world if 'student_world' in locals() else self.student_world_adapter(last_hidden_state)
+                _, dream_logs = self.dream_condition_swap_distill_loss(
+                    student_world_for_loss,
+                    teacher_outputs_for_loss,
+                    iteration=int(getattr(self, "current_distill_iter", 0)),
+                )
+                # Condition-swap is a verifier/gating signal only.  Keep its
+                # diagnostics, but do not add a separate swap loss or block the
+                # ordinary structural/three-stage distillation branch below.
+                for _k, _v in dream_logs.items():
+                    self.latest_loss_logs[_k] = _v.detach() if isinstance(_v, torch.Tensor) else _v
+                self.latest_loss_logs["dream_condition_swap_as_loss"] = torch.tensor(0.0, device=outputs.loss.device)
+                self.last_h_future = next((v for v in student_world_for_loss.values() if isinstance(v, torch.Tensor)), None)
+                self.last_teacher_latent = next((v for v in teacher_outputs_for_loss.values() if isinstance(v, torch.Tensor)), None)
+                self.last_z_teacher = None
+            if self.use_structural_world_distill and self.use_sgdrive_teacher and self.sgdrive_teacher is not None and self.student_world_adapter is not None and self.structural_world_distill_loss is not None:    
+                
                 teacher_outputs_for_loss = {
                     # "scene": features.get("teacher_scene", None),
                     # "agent": features.get("teacher_agent", None),
@@ -748,6 +811,9 @@ class ReCogDriveAgent(AbstractAgent):
                     distill_logs["trainable_param_ratio"] = self.latest_loss_logs["trainable_param_ratio"]
                     distill_logs["world_tokens_used_by_planner"] = self.latest_loss_logs["world_tokens_used_by_planner"]
                     distill_logs["distill_enabled"] = self.latest_loss_logs["distill_enabled"]
+                    for _k, _v in self.latest_loss_logs.items():
+                        if _k.startswith("dream_") or _k.startswith("loss_dream_"):
+                            distill_logs[_k] = _v
                     self.latest_loss_logs = distill_logs
                 else:
                     loss_struct_total, struct_logs = self.structural_world_distill_loss(student_world_for_loss, teacher_outputs_for_loss)
@@ -759,6 +825,9 @@ class ReCogDriveAgent(AbstractAgent):
                     struct_logs["world_tokens_used_by_planner"] = self.latest_loss_logs["world_tokens_used_by_planner"]
                     struct_logs["teacher_enabled"] = self.latest_loss_logs["teacher_enabled"]
                     struct_logs["distill_enabled"] = self.latest_loss_logs["distill_enabled"]
+                    for _k, _v in self.latest_loss_logs.items():
+                        if _k.startswith("dream_") or _k.startswith("loss_dream_"):
+                            struct_logs[_k] = _v
                     self.latest_loss_logs = struct_logs
             else:
                 self.last_teacher_latent = None

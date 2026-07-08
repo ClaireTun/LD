@@ -194,6 +194,143 @@ class HiddenDistillationLoss(nn.Module):
         return loss * self.weight, logs
 
 
+class DreamConditionSwapDistillLoss(nn.Module):
+    """Dream-only condition-swap verifier for ReCogDrive latent future tokens.
+
+    The teacher dream feature is projected once into the student token space only to
+    estimate whether teacher correction is useful.  The returned tensor is always a
+    zero loss so this module can be used as a judgment/logging condition without
+    adding an extra optimization objective.
+    """
+
+    def __init__(
+        self,
+        student_world_dim: int = 256,
+        dream_distill_keys: Optional[Iterable[str]] = None,
+        loss_type: str = "mse_plus_cosine",
+        teacher_weight: float = 1.0,
+        self_weight: float = 0.25,
+        teacher_anneal_iters: int = 0,
+        teacher_min_weight: float = 0.0,
+        utility_margin: float = 0.0,
+        ema_decay: float = 0.99,
+        detach_teacher: bool = True,
+        normalize: bool = True,
+        student_world_num_tokens: int = 1,
+        projector_type: str = "mlp",
+        teacher_latent_dim: int = 256,
+        projector_num_heads: int = 4,
+        projector_dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.dream_distill_keys = list(dream_distill_keys or ["dream_scene", "dream_agent"])
+        self.teacher_weight = float(teacher_weight)
+        self.self_weight = float(self_weight)
+        self.teacher_anneal_iters = int(teacher_anneal_iters)
+        self.teacher_min_weight = float(teacher_min_weight)
+        self.utility_margin = float(utility_margin)
+        self.ema_decay = float(ema_decay)
+        self.detach_teacher = bool(detach_teacher)
+        self.teacher_to_token_projector = nn.ModuleDict({
+            key: TeacherToTokenProjector(
+                teacher_latent_dim=teacher_latent_dim,
+                student_world_dim=student_world_dim,
+                num_tokens=student_world_num_tokens,
+                projector_type=projector_type,
+                num_heads=projector_num_heads,
+                dropout=projector_dropout,
+            ) for key in self.dream_distill_keys
+        })
+        self.hidden_loss = HiddenDistillationLoss(loss_type=loss_type, weight=1.0, normalize=normalize)
+        self._ema_self_teacher: Dict[str, torch.Tensor] = {}
+
+    def _teacher_weight(self, iteration: int) -> float:
+        if self.teacher_anneal_iters <= 0:
+            return self.teacher_weight
+        progress = min(1.0, max(0.0, float(iteration) / float(self.teacher_anneal_iters)))
+        return self.teacher_min_weight + (self.teacher_weight - self.teacher_min_weight) * (1.0 - progress)
+
+    def _update_ema(self, key: str, value: torch.Tensor) -> None:
+        value = value.detach()
+        prev = self._ema_self_teacher.get(key)
+        if prev is None or prev.shape != value.shape or prev.device != value.device:
+            self._ema_self_teacher[key] = value.clone()
+        else:
+            self._ema_self_teacher[key] = prev.mul(self.ema_decay).add(value, alpha=1.0 - self.ema_decay)
+
+    def forward(
+        self,
+        student_world: Dict[str, torch.Tensor],
+        teacher_outputs: Dict[str, Optional[torch.Tensor]],
+        iteration: int = 0,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        first_student = next((v for v in student_world.values() if isinstance(v, torch.Tensor)), None)
+        device = first_student.device if first_student is not None else torch.device("cpu")
+        zero = torch.tensor(0.0, device=device)
+        logs: Dict[str, torch.Tensor] = {
+            "loss_dream_condition_swap": zero,
+            "dream_condition_swap_candidate_loss": zero,
+            "loss_dream_external": zero,
+            "loss_dream_self": zero,
+            "dream_teacher_weight": torch.tensor(self._teacher_weight(iteration), device=device),
+            "dream_teacher_useful_ratio": zero,
+            "dream_ema_ready": zero,
+        }
+        total = zero
+        count = 0
+        useful_total = zero
+        ema_ready_total = zero
+        teacher_weight = self._teacher_weight(iteration)
+
+        for key in self.dream_distill_keys:
+            s = student_world.get(key)
+            t = teacher_outputs.get(key)
+            if s is None or t is None:
+                continue
+            if self.detach_teacher:
+                t = t.detach()
+            if t.dim() == 2:
+                t = t.unsqueeze(1)
+            z_teacher = self.teacher_to_token_projector[key](t.to(dtype=s.dtype, device=s.device))
+            if z_teacher.shape[1] != s.shape[1]:
+                z_teacher = F.interpolate(z_teacher.transpose(1, 2), size=s.shape[1], mode="nearest").transpose(1, 2)
+            if z_teacher.shape[-1] != s.shape[-1]:
+                z_teacher = TeacherToTokenProjector._resize_last_dim(z_teacher, s.shape[-1])
+
+            ema_target = self._ema_self_teacher.get(key)
+            ema_ready = ema_target is not None and ema_target.shape == s.shape and ema_target.device == s.device
+            if not ema_ready:
+                # Stage 1: teacher prior initializes latent future thought / EMA self-teacher.
+                ema_target = z_teacher.detach().clone()
+                self._ema_self_teacher[key] = ema_target
+            external_loss, _ = self.hidden_loss(s, z_teacher)
+            self_loss, _ = self.hidden_loss(s, ema_target.detach())
+            teacher_useful = torch.tensor(
+                1.0 if (teacher_weight > self.teacher_min_weight and external_loss.detach() <= self_loss.detach() + self.utility_margin) else 0.0,
+                device=s.device,
+                dtype=s.dtype,
+            )
+            key_loss = teacher_useful * (teacher_weight * external_loss) + (1.0 - teacher_useful) * (self.self_weight * self_loss)
+            total = total + key_loss
+            count += 1
+            useful_total = useful_total + teacher_useful.detach().float()
+            ema_ready_total = ema_ready_total + torch.tensor(1.0 if ema_ready else 0.0, device=device)
+            logs["loss_dream_external"] = logs["loss_dream_external"] + external_loss.detach()
+            logs["loss_dream_self"] = logs["loss_dream_self"] + self_loss.detach()
+            self._update_ema(key, s)
+
+        if count > 0:
+            total = total / count
+            logs["dream_condition_swap_candidate_loss"] = total.detach()
+            logs["loss_dream_external"] = logs["loss_dream_external"] / count
+            logs["loss_dream_self"] = logs["loss_dream_self"] / count
+            logs["dream_teacher_useful_ratio"] = useful_total / count
+            logs["dream_ema_ready"] = ema_ready_total / count
+        # The swap module is a verifier/gating signal only.  Do not backpropagate
+        # an additional dream-swap objective; keep the original distillation path
+        # responsible for optimization.
+        return zero, logs
+
 class StructuralWorldDistillLoss(nn.Module):
     def __init__(
         self,
