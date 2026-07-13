@@ -173,6 +173,26 @@ class ReCogDriveAgent(AbstractAgent):
         adaptive_stage2_intervention_threshold: float = 0.20,
         adaptive_teacher_anneal_epochs: int = 20,
 
+        use_decision_efficiency: bool = True,
+        decision_efficiency_stage: str = "stage2",
+        decision_efficiency_start_epoch: Optional[int] = None,
+        decision_efficiency_tau: float = 0.5,
+        decision_efficiency_eps: float = 0.0,
+        decision_efficiency_weight_min: float = 0.05,
+        decision_efficiency_weight_max: float = 1.0,
+        decision_efficiency_normalize: bool = True,
+        decision_efficiency_slot_level: bool = True,
+        decision_efficiency_mask_type: str = "learnable_null",
+        decision_efficiency_distance: str = "traj_l1",
+        decision_efficiency_top_pool: str = "softmax",
+        lambda_aux_plan: float = 0.05,
+        lambda_decision_efficiency_distill: float = 1.0,
+        detach_decision_hidden_for_aux: bool = True,
+        enable_decision_efficiency_stage1: bool = False,
+        enable_decision_efficiency_stage2: bool = True,
+        enable_decision_efficiency_stage3: bool = False,
+        stage1_aux_warmup: bool = True,
+
         experiment_tag: str = "",
         lora_r: int = 8,
         lora_alpha: int = 16,
@@ -217,6 +237,7 @@ class ReCogDriveAgent(AbstractAgent):
         self.metric_cache_path = metric_cache_path
         self.reference_policy_checkpoint = reference_policy_checkpoint
         self.vlm_size = vlm_size
+        self.vlm_feature_dim = 3584 if self.vlm_size == "large" else 1536
         self.train_backbone = train_backbone
         self.use_sgdrive_teacher = use_sgdrive_teacher
         self.debug_print_teacher_shapes = debug_print_teacher_shapes
@@ -328,6 +349,30 @@ class ReCogDriveAgent(AbstractAgent):
                     "adaptive_stage2_gate_threshold": adaptive_stage2_gate_threshold,
                     "adaptive_stage2_intervention_threshold": adaptive_stage2_intervention_threshold,
                     "adaptive_teacher_anneal_epochs": adaptive_teacher_anneal_epochs,
+                    
+                    "use_decision_efficiency": use_decision_efficiency,
+                    "decision_efficiency_stage": decision_efficiency_stage,
+                    "decision_efficiency_start_epoch": decision_efficiency_start_epoch,
+                    "decision_efficiency_tau": decision_efficiency_tau,
+                    "decision_efficiency_eps": decision_efficiency_eps,
+                    "decision_efficiency_weight_min": decision_efficiency_weight_min,
+                    "decision_efficiency_weight_max": decision_efficiency_weight_max,
+                    "decision_efficiency_normalize": decision_efficiency_normalize,
+                    "decision_efficiency_slot_level": decision_efficiency_slot_level,
+                    "decision_efficiency_mask_type": decision_efficiency_mask_type,
+                    "decision_efficiency_distance": decision_efficiency_distance,
+                    "decision_efficiency_top_pool": decision_efficiency_top_pool,
+                    "lambda_aux_plan": lambda_aux_plan,
+                    "lambda_decision_efficiency_distill": lambda_decision_efficiency_distill,
+                    "detach_decision_hidden_for_aux": detach_decision_hidden_for_aux,
+                    "enable_decision_efficiency_stage1": enable_decision_efficiency_stage1,
+                    "enable_decision_efficiency_stage2": enable_decision_efficiency_stage2,
+                    "enable_decision_efficiency_stage3": enable_decision_efficiency_stage3,
+                    "stage1_aux_warmup": stage1_aux_warmup,
+                    "decision_efficiency_slot_dim": student_world_dim,
+                    "decision_hidden_dim": self.vlm_feature_dim,
+
+                    
                 }
             )
 
@@ -357,7 +402,8 @@ class ReCogDriveAgent(AbstractAgent):
             cfg = make_recogdrive_config(self.dit_type, action_dim=3, action_horizon=8, grpo=self.grpo, input_embedding_dim=384,sampling_method=sampling_method)
 
         cfg.vlm_size = self.vlm_size
-        vlm_feature_dim = 3584 if self.vlm_size == "large" else 1536
+        #vlm_feature_dim = 3584 if self.vlm_size == "large" else 1536
+        vlm_feature_dim = self.vlm_feature_dim
 
         cfg.use_world_denoise_influence = use_world_denoise_influence
         cfg.world_denoise_influence_type = world_denoise_influence_type
@@ -822,11 +868,13 @@ class ReCogDriveAgent(AbstractAgent):
                         teacher_enabled=self.use_sgdrive_teacher,
                         teacher_requires_grad_count=teacher_requires_grad_count,
                         teacher_gate=dream_teacher_gate,
+                        decision_hidden=last_hidden_state,
                     )
                     loss_three_stage = (
                         distill_losses["loss_hidden"]
                         + distill_losses["loss_corrective"]
                         + distill_losses["loss_consistency"]
+                        + distill_losses.get("loss_aux_plan", zero)
                     )
                     outputs.loss = outputs.loss + loss_three_stage
                     distill_logs["loss_plan"] = self.latest_loss_logs["loss_plan"]
@@ -835,6 +883,7 @@ class ReCogDriveAgent(AbstractAgent):
                     distill_logs["loss_hidden"] = distill_losses["loss_hidden"].detach()
                     distill_logs["loss_corrective_weighted"] = distill_losses["loss_corrective"].detach()
                     distill_logs["loss_consistency_weighted"] = distill_losses["loss_consistency"].detach()
+                    distill_logs["loss_aux_plan_weighted"] = distill_losses.get("loss_aux_plan", zero).detach()
                     distill_logs["trainable_param_ratio"] = self.latest_loss_logs["trainable_param_ratio"]
                     distill_logs["world_tokens_used_by_planner"] = self.latest_loss_logs["world_tokens_used_by_planner"]
                     distill_logs["distill_enabled"] = self.latest_loss_logs["distill_enabled"]
@@ -977,6 +1026,8 @@ class ReCogDriveAgent(AbstractAgent):
             params += [self.world_condition_gate]
         if self.drivemem is not None:
             params += list(self.drivemem.parameters())
+        if self.three_stage_distiller is not None:
+            params += list(self.three_stage_distiller.parameters())
 
         optimizer = build_from_configs(optim, optimizer_cfg, params=params)
         

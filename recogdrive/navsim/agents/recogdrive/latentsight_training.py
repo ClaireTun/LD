@@ -394,8 +394,11 @@ def set_v2_finetune_mode(model: nn.Module, mode: str, cfg: Optional[Any] = None)
     planner_condition_keywords = ("world_condition_projector", "world_condition_gate", "world_denoise_modulator")
     #new_module_keywords = future_query_keywords + distill_projector_keywords + planner_condition_keywords
     drivemem_keywords = ("drivemem",)
-    new_module_keywords = future_query_keywords + distill_projector_keywords + planner_condition_keywords + drivemem_keywords
+    #new_module_keywords = future_query_keywords + distill_projector_keywords + planner_condition_keywords + drivemem_keywords
     
+    decision_efficiency_keywords = ("three_stage_distiller", "aux_traj_head", "decision_null_slot")
+    new_module_keywords = future_query_keywords + distill_projector_keywords + planner_condition_keywords + drivemem_keywords + decision_efficiency_keywords
+
     planner_keywords = ("action_head",)
     vlm_keywords = ("backbone",)
 

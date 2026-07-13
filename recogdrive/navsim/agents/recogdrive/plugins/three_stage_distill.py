@@ -349,6 +349,40 @@ from torch import nn
 import torch.nn.functional as F
 
 
+class AuxiliaryPlanningProbe(nn.Module):
+    """Training-only probe: predicts a trajectory from detached decision hidden + live future slots."""
+
+    def __init__(
+        self,
+        decision_hidden_dim: int = 1536,
+        future_dim: int = 256,
+        action_horizon: int = 8,
+        action_dim: int = 3,
+        hidden_dim: int = 256,
+    ) -> None:
+        super().__init__()
+        self.action_horizon = int(action_horizon)
+        self.action_dim = int(action_dim)
+        input_dim = int(decision_hidden_dim) + int(future_dim)
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, self.action_horizon * self.action_dim),
+        )
+
+    def forward(self, decision_hidden: torch.Tensor, future_slots: torch.Tensor) -> torch.Tensor:
+        if decision_hidden.dim() == 3:
+            d = decision_hidden.mean(dim=1)
+        else:
+            d = decision_hidden.flatten(start_dim=1)
+        e = future_slots.mean(dim=1)
+        y = self.net(torch.cat([d, e], dim=-1))
+        return y.view(future_slots.shape[0], self.action_horizon, self.action_dim)
+
+
 @dataclass
 class ThreeStageDistillConfig:
     use_three_stage_distill: bool = False
@@ -392,6 +426,29 @@ class ThreeStageDistillConfig:
     adaptive_stage2_gate_threshold: float = 0.35
     adaptive_stage2_intervention_threshold: float = 0.20
     adaptive_teacher_anneal_epochs: int = 20
+    use_decision_efficiency: bool = True
+    decision_efficiency_stage: str = "stage2"
+    decision_efficiency_start_epoch: Optional[int] = None
+    decision_efficiency_tau: float = 0.5
+    decision_efficiency_eps: float = 0.0
+    decision_efficiency_weight_min: float = 0.05
+    decision_efficiency_weight_max: float = 1.0
+    decision_efficiency_normalize: bool = True
+    decision_efficiency_slot_level: bool = True
+    decision_efficiency_mask_type: str = "learnable_null"
+    decision_efficiency_distance: str = "traj_l1"
+    decision_efficiency_top_pool: str = "softmax"
+    lambda_aux_plan: float = 0.05
+    lambda_decision_efficiency_distill: float = 1.0
+    detach_decision_hidden_for_aux: bool = True
+    enable_decision_efficiency_stage1: bool = False
+    enable_decision_efficiency_stage2: bool = True
+    enable_decision_efficiency_stage3: bool = False
+    stage1_aux_warmup: bool = True
+    decision_efficiency_slot_dim: int = 256
+    decision_hidden_dim: int = 1536
+    decision_aux_hidden_dim: int = 256
+
 
 
 def _cfg_get(cfg: Any, name: str, default: Any) -> Any:
@@ -429,6 +486,14 @@ class ThreeStageImaginationDistiller(nn.Module):
         merged.update(kwargs)
         self.cfg = ThreeStageDistillConfig(**merged)
         self._printed_sanity = False
+
+        self.aux_traj_head = AuxiliaryPlanningProbe(
+            decision_hidden_dim=int(self.cfg.decision_hidden_dim),
+            future_dim=int(self.cfg.decision_efficiency_slot_dim),
+            hidden_dim=int(self.cfg.decision_aux_hidden_dim),
+        )
+        self.decision_null_slot = nn.Parameter(torch.zeros(1, 1, int(self.cfg.decision_efficiency_slot_dim)))
+
         self.register_buffer("adaptive_stage_idx", torch.tensor(1.0), persistent=True)
         self.register_buffer("adaptive_stage1_loss_ema", torch.tensor(float("inf")), persistent=True)
         self.register_buffer("adaptive_stage1_best", torch.tensor(float("inf")), persistent=True)
@@ -630,6 +695,121 @@ class ThreeStageImaginationDistiller(nn.Module):
         if weights.sum().detach() <= self.cfg.eps:
             return per_sample.sum() * 0.0
         return (per_sample * weights).sum() / denom
+    
+    def _per_sample_traj_l1(self, pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+        gt = gt.to(device=pred.device, dtype=pred.dtype)
+        if pred.shape != gt.shape:
+            min_dims = tuple(min(a, b) for a, b in zip(pred.shape, gt.shape))
+            pred = pred[tuple(slice(0, d) for d in min_dims)]
+            gt = gt[tuple(slice(0, d) for d in min_dims)]
+        return (pred.float() - gt.float()).abs().flatten(start_dim=1).mean(dim=1)
+
+    def _decision_efficiency_enabled(self, stage: str, epoch: int) -> bool:
+        if not self.cfg.use_decision_efficiency:
+            return False
+        start_epoch = self.cfg.decision_efficiency_start_epoch
+        if start_epoch is not None and epoch < int(start_epoch):
+            return False
+        if stage == "init":
+            return bool(self.cfg.enable_decision_efficiency_stage1)
+        if stage == "corrective":
+            return bool(self.cfg.enable_decision_efficiency_stage2)
+        return bool(self.cfg.enable_decision_efficiency_stage3)
+
+    def _replacement_slot(self, future_slots: torch.Tensor) -> torch.Tensor:
+        mask_type = self.cfg.decision_efficiency_mask_type
+        if mask_type == "zero":
+            return torch.zeros(future_slots.shape[0], future_slots.shape[-1], device=future_slots.device, dtype=future_slots.dtype)
+        if mask_type == "batch_mean":
+            return future_slots.detach().mean(dim=(0, 1), keepdim=False).unsqueeze(0).expand(future_slots.shape[0], -1).to(dtype=future_slots.dtype)
+        if mask_type == "learnable_null":
+            if self.decision_null_slot.shape[-1] == future_slots.shape[-1]:
+                return self.decision_null_slot.to(device=future_slots.device, dtype=future_slots.dtype).expand(future_slots.shape[0], 1, -1).squeeze(1)
+            return torch.zeros(future_slots.shape[0], future_slots.shape[-1], device=future_slots.device, dtype=future_slots.dtype)
+        raise ValueError(f"Unsupported decision_efficiency_mask_type={mask_type}")
+
+    def dist_per_slot(self, h_future: torch.Tensor, z_teacher: torch.Tensor) -> torch.Tensor:
+        z_teacher = self.align_tokens(z_teacher, h_future)
+        h_norm = F.normalize(h_future.float(), dim=-1)
+        z_norm = F.normalize(z_teacher.float(), dim=-1)
+        mse = (h_norm - z_norm).pow(2).mean(dim=2)
+        cos = 1.0 - F.cosine_similarity(h_future.float(), z_teacher.float(), dim=-1)
+        return mse + self.cfg.beta_cos * cos
+
+    def decision_efficiency(
+        self,
+        *,
+        decision_hidden: torch.Tensor,
+        h_future: torch.Tensor,
+        traj_pred: torch.Tensor,
+        traj_gt: torch.Tensor,
+        base_weight: torch.Tensor,
+        stage: str,
+        epoch: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        assert h_future.dim() == 3, "H_future must be [B,K,C] for slot-level decision efficiency"
+        B, K, _ = h_future.shape
+        d_aux = decision_hidden.detach() if self.cfg.detach_decision_hidden_for_aux else decision_hidden
+        y_aux_full = self.aux_traj_head(d_aux, h_future)
+        assert y_aux_full.shape == traj_pred.shape, "Y_aux_full must match Y_base/traj_pred shape"
+        l_base_each = self._per_sample_traj_l1(traj_pred.detach(), traj_gt)
+        l_aux_each = self._per_sample_traj_l1(y_aux_full, traj_gt)
+        assert l_base_each.shape == (B,)
+        assert l_aux_each.shape == (B,)
+        enabled = self._decision_efficiency_enabled(stage, epoch)
+        if enabled:
+            replacement = self._replacement_slot(h_future)
+            s_list = []
+            for k in range(K):
+                e_mask = h_future.clone()
+                e_mask[:, k, :] = replacement
+                y_mask = self.aux_traj_head(d_aux, e_mask)
+                s_list.append((y_aux_full.detach() - y_mask.detach()).abs().flatten(start_dim=1).mean(dim=1))
+            S = torch.stack(s_list, dim=1)
+            delta_l = l_base_each.detach() - l_aux_each.detach()
+            if self.cfg.decision_efficiency_normalize:
+                s_std = S.std(dim=1, keepdim=True, unbiased=False)
+                S_score = (S - S.mean(dim=1, keepdim=True)) / (s_std + 1e-6)
+                d_std = delta_l.std(unbiased=False)
+                delta_score = (delta_l - delta_l.mean()) / (d_std + 1e-6)
+            else:
+                S_score, delta_score = S, delta_l
+            score = S_score + delta_score[:, None]
+            decision_weight_k = torch.sigmoid((score - float(self.cfg.decision_efficiency_eps)) / max(float(self.cfg.decision_efficiency_tau), 1e-6))
+            decision_weight_k = decision_weight_k.clamp(float(self.cfg.decision_efficiency_weight_min), float(self.cfg.decision_efficiency_weight_max)).detach()
+        else:
+            S = torch.zeros(B, K, device=h_future.device, dtype=h_future.dtype)
+            delta_l = l_base_each.detach() - l_aux_each.detach()
+            decision_weight_k = torch.ones(B, K, device=h_future.device, dtype=h_future.dtype)
+        final_weight_k = (base_weight.detach()[:, None] * decision_weight_k).detach()
+        assert decision_weight_k.shape == (B, K)
+        assert final_weight_k.shape == (B, K)
+        logs = {
+            "decision_efficiency_enabled": torch.tensor(1.0 if enabled else 0.0, device=h_future.device),
+            "decision_L_base_mean": l_base_each.detach().mean(),
+            "decision_L_aux_mean": l_aux_each.detach().mean(),
+            "decision_delta_L_mean": delta_l.detach().mean(),
+            "decision_delta_L_std": delta_l.detach().std(unbiased=False),
+            "decision_positive_ratio": (delta_l.detach() > 0).float().mean(),
+            "decision_S_mean": S.detach().mean(),
+            "decision_S_std": S.detach().std(unbiased=False),
+            "decision_S_max": S.detach().max() if S.numel() else torch.tensor(0.0, device=h_future.device),
+            "decision_S_min": S.detach().min() if S.numel() else torch.tensor(0.0, device=h_future.device),
+            "decision_weight_mean": decision_weight_k.mean(),
+            "decision_weight_max": decision_weight_k.max(),
+            "decision_weight_min": decision_weight_k.min(),
+            "base_weight_mean": base_weight.detach().mean(),
+            "final_weight_k_mean": final_weight_k.mean(),
+            "lambda_aux_plan": torch.tensor(float(self.cfg.lambda_aux_plan), device=h_future.device),
+        }
+        return final_weight_k, l_aux_each.mean(), logs
+
+    def weighted_distill_slots(self, h_future: torch.Tensor, z_teacher: torch.Tensor, weights_k: torch.Tensor) -> torch.Tensor:
+        per_slot = self.dist_per_slot(h_future, z_teacher)
+        weights_k = torch.where(torch.isfinite(weights_k), weights_k, torch.zeros_like(weights_k)).to(per_slot.dtype)
+        if weights_k.sum().detach() <= self.cfg.eps:
+            return per_slot.sum() * 0.0
+        return (per_slot * weights_k).sum(dim=1).mean()
 
     def compute_consistency_loss(
         self,
@@ -689,6 +869,7 @@ class ThreeStageImaginationDistiller(nn.Module):
         teacher_enabled: bool = True,
         teacher_requires_grad_count: int = 0,
         teacher_gate: Optional[torch.Tensor] = None,
+        decision_hidden: Optional[torch.Tensor] = None,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         device = h_future.device if h_future is not None else (z_teacher.device if z_teacher is not None else torch.device("cpu"))
         zero = torch.tensor(0.0, device=device)
@@ -728,7 +909,8 @@ class ThreeStageImaginationDistiller(nn.Module):
             "adaptive_stage2_low_steps": self.adaptive_stage2_low_steps.detach().to(device=device),
             "adaptive_stage3_start_epoch": self.adaptive_stage3_start_epoch.detach().to(device=device),
         }
-        losses = {"loss_hidden": zero, "loss_corrective": zero, "loss_consistency": zero}
+        #losses = {"loss_hidden": zero, "loss_corrective": zero, "loss_consistency": zero}
+        losses = {"loss_hidden": zero, "loss_corrective": zero, "loss_consistency": zero, "loss_aux_plan": zero}
 
         if not self.cfg.use_three_stage_distill or not teacher_enabled or h_future is None or z_teacher is None:
             return losses, logs
@@ -762,6 +944,24 @@ class ThreeStageImaginationDistiller(nn.Module):
                         gate = gate[: weights.numel()] if gate.numel() > weights.numel() else F.pad(gate, (0, weights.numel() - gate.numel()))
                 weights = weights * gate.clamp(0.0, 1.0)
             corr = self.weighted_distill(h_future, z_teacher, weights)
+            base_weight = weights
+            final_weight_k = None
+            aux_loss = h_future.sum() * 0.0
+            if self._decision_efficiency_enabled(stage, epoch) and decision_hidden is not None and traj_pred is not None and traj_gt is not None and self.cfg.decision_efficiency_slot_level:
+                final_weight_k, aux_loss, de_logs = self.decision_efficiency(
+                    decision_hidden=decision_hidden,
+                    h_future=h_future,
+                    traj_pred=traj_pred.to(device=h_future.device, dtype=h_future.dtype),
+                    traj_gt=traj_gt.to(device=h_future.device, dtype=h_future.dtype),
+                    base_weight=base_weight,
+                    stage=stage,
+                    epoch=epoch,
+                )
+                logs.update(de_logs)
+                corr = self.weighted_distill_slots(h_future, z_teacher, final_weight_k)
+                losses["loss_aux_plan"] = float(self.cfg.lambda_aux_plan) * aux_loss
+            else:
+                corr = self.weighted_distill(h_future, z_teacher, weights)
             logs.update(weight_logs)
             logs["teacher_gate_mean"] = (teacher_gate.detach().float().mean().to(device) if teacher_gate is not None else torch.tensor(1.0, device=device))
             logs["failure_score_mean"] = failure.detach().mean()
@@ -770,7 +970,8 @@ class ThreeStageImaginationDistiller(nn.Module):
             logs["intervention_weight_mean"] = weights.detach().mean()
             logs["intervention_weight_max"] = weights.detach().max() if weights.numel() else zero
             if stage == "corrective":
-                losses["loss_corrective"] = self.cfg.lambda_corr * corr
+                #losses["loss_corrective"] = self.cfg.lambda_corr * corr
+                losses["loss_corrective"] = self.cfg.lambda_corr * float(self.cfg.lambda_decision_efficiency_distill) * corr
             else:
                 teacher_weight = self.teacher_lambda(epoch)
                 losses["loss_corrective"] = teacher_weight * corr
@@ -780,6 +981,9 @@ class ThreeStageImaginationDistiller(nn.Module):
                 losses["loss_consistency"] = self.cfg.lambda_cons * cons
                 logs["loss_consistency"] = cons.detach()
             logs["loss_corrective"] = corr.detach()
+            logs["raw_distill_loss"] = self.dist_per_sample(h_future.detach(), z_teacher.detach()).mean().detach()
+            logs["weighted_corr_distill_loss"] = corr.detach()
+            logs["loss_aux_plan"] = losses["loss_aux_plan"].detach()
 
         self.update_adaptive_stage(
             stage=stage,
